@@ -1,0 +1,6 @@
+wcn@PC-202409140818:~$ bsdiff old.bin new.bin patch111.bsdiff
+wcn@PC-202409140818:~$ ls -ln patch111.bsdiff 
+-rw-r--r-- 1 1000 1000 57022 Nov 20 09:48 patch111.bsdiff
+wcn@PC-202409140818:~$ xdelta3 -e -s old.bin new.bin patch111.xdelta
+wcn@PC-202409140818:~$ ls -ln patch111.xdelta 
+-rw-r--r-- 1 1000 1000 84531 Nov 20 09:49 patch111.xdelta

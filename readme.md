@@ -1,5 +1,7 @@
 # Semantic-Aware Firmware Diff Generator
 
+[中文版请参见 `readme.zh.md`](readme.zh.md)。
+
 This project provides a firmware delta update generator designed for resource-constrained microcontrollers (e.g. micro/nano satellites). It produces small, frame-friendly patch streams that can be verified and applied with minimal RAM on the target.
 
 Key features:

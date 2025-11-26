@@ -10,7 +10,7 @@ Language / 语言：<a href="#readme-en">English</a> | <a href="#readme-zh">简�
 
 ## English
 
-This project provides a firmware delta update generator designed for resource-constrained microcontrollers (e.g. micro/nano satellites). It produces small, frame-friendly patch streams that can be verified and applied with minimal RAM on the target.
+This project provides a firmware delta update generator designed for resource-constrained microcontrollers. It produces small, frame-friendly patch streams that can be verified and applied with minimal RAM on the target.
 
 ### Key Features
 
@@ -98,7 +98,7 @@ For questions or contributions, open an issue or submit a pull request.
 
 ## 简体中文
 
-本项目提供一个面向资源受限微控制器（如微/纳卫星）的固件增量更新生成器。它可以生成小型、易分帧的补丁流，并在目标端以极少 RAM 即可验证和应用。
+本项目提供一个面向资源受限微控制器的固件增量更新生成器。它可以生成小型、易分帧的补丁流，并在目标端以极少 RAM 即可验证和应用。
 
 ### 主要特性
 

@@ -34,9 +34,9 @@ This project provides a firmware delta update generator designed for resource-co
 
 ```bash
 python -m generator.tools.iar_dump2json \
-  --out QLS01CDHS224.out \
-  --json QLS01CDHS224.json \
-  --txt  QLS01CDHS224.txt
+  --out old.out \
+  --json old.json \
+  --txt  old.txt
 ```
 
 Repeat for the “new” firmware. This step uses IAR’s `ielfdumparm.exe`, so ensure it is available in `PATH` or the script’s directory.
@@ -45,12 +45,12 @@ Repeat for the “new” firmware. This step uses IAR’s `ielfdumparm.exe`, so 
 
 ```bash
 python -m generator.generate gen \
-  --old QLS01CDHS224.bin \
-  --new QLS01CDHS225.bin \
-  --old-sym QLS01CDHS224.json \
-  --new-sym QLS01CDHS225.json \
+  --old olf.bin \
+  --new new.bin \
+  --old-sym old.json \
+  --new-sym new.json \
   --flash-base 0x00000000 \
-  --out QLS01CDHSpatch.bin \
+  --out patch.bin \
   --mode global \
   --arch-mode arm \
   --endian be \
@@ -66,9 +66,9 @@ Notes:
 
 ```bash
 python -m generator.tools.patch_sim \
-  --old QLS01CDHS224.bin \
-  --patch QLS01CDHSpatch.bin \
-  --new QLS01CDHS225.bin \
+  --old old.bin \
+  --patch patch.bin \
+  --new new.bin \
   --payload 502 \
   --scale 50
 ```
@@ -122,9 +122,9 @@ For questions or contributions, open an issue or submit a pull request.
 
 ```bash
 python -m generator.tools.iar_dump2json \
-  --out QLS01CDHS224.out \
-  --json QLS01CDHS224.json \
-  --txt  QLS01CDHS224.txt
+  --out old.out \
+  --json old.json \
+  --txt  old.txt
 ```
 
 对“新”固件重复上述操作。该步骤依赖 IAR 的 `ielfdumparm.exe`，请确保其位于 `PATH` 或脚本目录中。
@@ -133,12 +133,12 @@ python -m generator.tools.iar_dump2json \
 
 ```bash
 python -m generator.generate gen \
-  --old QLS01CDHS224.bin \
-  --new QLS01CDHS225.bin \
-  --old-sym QLS01CDHS224.json \
-  --new-sym QLS01CDHS225.json \
+  --old old.bin \
+  --new new.bin \
+  --old-sym old.json \
+  --new-sym new.json \
   --flash-base 0x00000000 \
-  --out QLS01CDHSpatch.bin \
+  --out patch.bin \
   --mode global \
   --arch-mode arm \
   --endian be \
@@ -154,9 +154,9 @@ python -m generator.generate gen \
 
 ```bash
 python -m generator.tools.patch_sim \
-  --old QLS01CDHS224.bin \
-  --patch QLS01CDHSpatch.bin \
-  --new QLS01CDHS225.bin \
+  --old old.bin \
+  --patch patch.bin \
+  --new new.bin \
   --payload 502 \
   --scale 50
 ```

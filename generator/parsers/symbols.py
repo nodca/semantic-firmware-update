@@ -237,93 +237,51 @@ def load_symbols_any(sym_json: Optional[str], map_path: Optional[str], flash_bas
     return raw_data, parsed_syms
 
 def _parse_json_data(data: dict) -> Dict[str, List[Symbol]]:
-    """
-    从已加载的 JSON dict 中解析符号。优先使用 addr - flash_base 计算偏移。
-    支持多种结构，包括：
-    1. 标准符号表结构: {'flash_base': ..., 'symbols': [...]}
-    2. sections 结构: {'sections': {'0': {...}, '1': {...}, ...}}
-    3. 嵌套符号表: {'sections': {'section_name': {'symbols': [...]}}}
-    """
+    """Parse symbols from the JSON dump, tolerating different layouts."""
     grouped: Dict[str, List[Symbol]] = defaultdict(list)
-    
-    # 获取 flash_base
-    flash_base = int(data.get('flash_base', 0x08000000))  # 默认使用典型STM32 flash基址
-    
-    # 1. 优先处理 sections 结构（针对您提供的JSON格式）
-    if 'sections' in data and isinstance(data['sections'], dict):
-        sections = data['sections']
+    flash_base = int(data.get('flash_base', 0x08000000))
+
+    def _append_symbol(name: str, off: Optional[int], size: int) -> None:
+        if off is None or off < 0 or size <= 0:
+            return
+        if not _good_sym_name(name):
+            return
+        grouped[name].append(Symbol(name, off, size))
+
+    sections = data.get('sections')
+    if isinstance(sections, dict):
         print(f"  [解析] 检测到 sections 结构，共 {len(sections)} 个段")
-        
         for sec_idx, sec_info in sections.items():
             if not isinstance(sec_info, dict):
                 continue
-                
-            # 情况1: 直接在section中包含符号信息
-            if all(k in sec_info for k in ['addr', 'file_offset', 'size']):
-                sym_name = sec_info.get('name', f'section_{sec_idx}')
-                if _good_sym_name(sym_name):
-                    size = int(sec_info['size'])
-                    if size > 0:
-                        # 优先使用addr计算偏移
-                        if 'addr' in sec_info and flash_base > 0:
-                            off = int(sec_info['addr']) - flash_base
-                        else:
-                            off = int(sec_info['file_offset'])
-                        
-                        if off >= 0:
-                            grouped[sym_name].append(Symbol(sym_name, off, size))
-            
-            # 情况2: section内包含symbols子结构
-            elif 'symbols' in sec_info and isinstance(sec_info['symbols'], dict):
-                symbols = sec_info['symbols']
-                print(f"  [解析] 段 {sec_idx} 包含 {len(symbols)} 个符号")
-                
-                for sym_name, sym_info in symbols.items():
-                    if not isinstance(sym_info, dict):
-                        continue
-                    if not _good_sym_name(sym_name):
-                        continue
-                        
-                    size = int(sym_info.get('size', 0) or 0)
-                    if size <= 0:
-                        continue
-                    
-                    # 优先使用addr计算偏移
-                    off = None
-                    if 'addr' in sym_info and flash_base > 0:
-                        off = int(sym_info['addr']) - flash_base
-                    elif 'file_offset' in sym_info:
-                        off = int(sym_info['file_offset'])
-                    elif 'off' in sym_info:
-                        off = int(sym_info['off'])
-                    
-                    if off is not None and off >= 0:
-                        grouped[sym_name].append(Symbol(sym_name, off, size))
-        
-        # 如果成功提取了符号，直接返回
-        if grouped:
-            print(f"  [解析] 成功从 sections 结构提取 {len(grouped)} 个符号")
-            for lst in grouped.values():
-                lst.sort(key=lambda s: s.off)
-            return grouped
-    
-    # 2. 处理标准符号表结构（列表格式）
-    syms = data.get('symbols', data)  # 兼容根即为 symbols 的情况
-    
-    # 结构 B：list 格式
+            symbols = sec_info.get('symbols')
+            if not isinstance(symbols, dict):
+                continue
+            print(f"  [解析] 段 {sec_idx} 包含 {len(symbols)} 个符号")
+            for sym_name, sym_info in symbols.items():
+                if not isinstance(sym_info, dict):
+                    continue
+                size = int(sym_info.get('size', 0) or 0)
+                if size <= 0:
+                    continue
+                off = None
+                if 'addr' in sym_info and flash_base > 0:
+                    off = int(sym_info['addr']) - flash_base
+                elif 'file_offset' in sym_info:
+                    off = int(sym_info['file_offset'])
+                elif 'off' in sym_info:
+                    off = int(sym_info['off'])
+                _append_symbol(sym_name, off, size)
+
+    syms = data.get('symbols', data)
     if isinstance(syms, list):
         print(f"  [解析] 检测到列表格式符号表，共 {len(syms)} 个条目")
         for ent in syms:
             if not isinstance(ent, dict):
                 continue
-            name = ent.get('name') or ent.get('symbol') or ent.get('func') or ""
-            if not name or not _good_sym_name(name):
-                continue
             size = int(ent.get('size', 0) or 0)
             if size <= 0:
                 continue
-            
-            # 优先使用 addr 计算偏移
             off = None
             if 'addr' in ent and flash_base > 0:
                 off = int(ent['addr']) - flash_base
@@ -331,28 +289,17 @@ def _parse_json_data(data: dict) -> Dict[str, List[Symbol]]:
                 off = int(ent['file_offset'])
             elif 'off' in ent:
                 off = int(ent['off'])
-            
-            if off is not None and off >= 0:
-                grouped[name].append(Symbol(name, off, size))
-        
+            name = ent.get('name') or ent.get('symbol') or ent.get('func') or ''
+            _append_symbol(name, off, size)
         for lst in grouped.values():
             lst.sort(key=lambda s: s.off)
         return grouped
 
-    # 结构 A：dict 格式
     if isinstance(syms, dict):
         print(f"  [解析] 检测到字典格式符号表，共 {len(syms)} 个条目")
         for name, meta in syms.items():
-            if not _good_sym_name(name):
-                continue
-            
-            # 单个符号元数据 (dict)
             if isinstance(meta, dict):
                 size = int(meta.get('size', 0) or 0)
-                if size <= 0:
-                    continue
-                
-                # 优先使用 addr 计算偏移
                 off = None
                 if 'addr' in meta and flash_base > 0:
                     off = int(meta['addr']) - flash_base
@@ -360,60 +307,42 @@ def _parse_json_data(data: dict) -> Dict[str, List[Symbol]]:
                     off = int(meta['file_offset'])
                 elif 'off' in meta:
                     off = int(meta['off'])
-                
-                if off is not None and off >= 0:
-                    grouped[name].append(Symbol(name, off, size))
-            
-            # 同名多段符号 (list)
+                _append_symbol(name, off, size)
             elif isinstance(meta, list):
                 for seg in meta:
-                    try:
-                        if not isinstance(seg, dict):
-                            continue
-                        size = int(seg.get('size', 0) or 0)
-                        if size <= 0:
-                            continue
-                        
-                        # 优先使用 addr 计算偏移
-                        off = None
-                        if 'addr' in seg and flash_base > 0:
-                            off = int(seg['addr']) - flash_base
-                        elif 'file_offset' in seg:
-                            off = int(seg['file_offset'])
-                        elif 'off' in seg:
-                            off = int(seg['off'])
-                        
-                        if off is not None and off >= 0:
-                            grouped[name].append(Symbol(name, off, size))
-                    except Exception as e:
-                        print(f"  [警告] 解析符号 {name} 的段时出错: {e}")
+                    if not isinstance(seg, dict):
                         continue
-        
+                    size = int(seg.get('size', 0) or 0)
+                    off = None
+                    if 'addr' in seg and flash_base > 0:
+                        off = int(seg['addr']) - flash_base
+                    elif 'file_offset' in seg:
+                        off = int(seg['file_offset'])
+                    elif 'off' in seg:
+                        off = int(seg['off'])
+                    _append_symbol(name, off, size)
         for lst in grouped.values():
             lst.sort(key=lambda s: s.off)
         return grouped
-    
-    # 3. 最后尝试直接在顶级查找符号
-    print("  [解析] 尝试直接在顶级查找符号字段")
+
+    print("  [解析] 尝试直接在顶级查找符号字典")
     for name, value in data.items():
-        if isinstance(value, dict) and all(k in value for k in ['addr', 'size']):
-            if _good_sym_name(name):
-                size = int(value['size'])
-                if size > 0:
-                    if 'addr' in value and flash_base > 0:
-                        off = int(value['addr']) - flash_base
-                    elif 'file_offset' in value:
-                        off = int(value['file_offset'])
-                    else:
-                        continue
-                    
-                    if off >= 0:
-                        grouped[name].append(Symbol(name, off, size))
-    
-    # 4. 按偏移排序
+        if not isinstance(value, dict):
+            continue
+        size = int(value.get('size', 0) or 0)
+        if size <= 0:
+            continue
+        off = None
+        if 'addr' in value and flash_base > 0:
+            off = int(value['addr']) - flash_base
+        elif 'file_offset' in value:
+            off = int(value['file_offset'])
+        elif 'off' in value:
+            off = int(value['off'])
+        _append_symbol(name, off, size)
+
     for lst in grouped.values():
         lst.sort(key=lambda s: s.off)
-    
     print(f"  [解析] 最终提取到 {len(grouped)} 个符号")
     return grouped
 

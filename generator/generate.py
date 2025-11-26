@@ -7,7 +7,7 @@ import json
 import os
 import sys
 import subprocess
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 from tqdm import tqdm
 
 from generator.strategies.global_match import global_greedy_hybrid
@@ -120,6 +120,116 @@ def _build_normalized_stream_from_raw(
             norm[off:off + 4] = norm_word.to_bytes(4, "big" if be else "little")
 
     return bytes(norm)
+
+def _looks_like_function(name: str) -> bool:
+    if not name:
+        return False
+    bad_prefix = ("$", ".L", "__", "@")
+    return not name.startswith(bad_prefix)
+
+def _build_code_mask_from_symbols(
+    raw_json: Optional[dict],
+    parsed_syms: Optional[Dict[str, List]],
+    new_len: int,
+    flash_base: int,
+) -> Tuple[Optional[List[bool]], Optional[List[int]]]:
+    """
+    Construct a boolean code mask and function-boundary prefix array from symbol metadata.
+    """
+    if new_len <= 0:
+        return None, None
+
+    mask = [False] * new_len
+    func_flags = [False] * new_len
+    code_names: set = set()
+    symbol_meta = None
+
+    if isinstance(raw_json, dict):
+        symbol_meta = raw_json.get("symbols")
+        if isinstance(symbol_meta, dict):
+            for name, meta in symbol_meta.items():
+                entries = meta if isinstance(meta, list) else [meta]
+                for ent in entries:
+                    if not isinstance(ent, dict):
+                        continue
+                    typ = str(ent.get("type", "")).lower()
+                    if typ == "code":
+                        code_names.add(name)
+
+    def _mark_range(name: str, off: int, size: int) -> None:
+        if size <= 0 or off >= new_len or off < 0:
+            return
+        end = min(new_len, off + size)
+        for idx in range(off, end):
+            mask[idx] = True
+        if _looks_like_function(name) and size >= 24:
+            func_flags[off] = True
+
+    has_ranges = False
+    if parsed_syms:
+        for name, entries in parsed_syms.items():
+            if not entries:
+                continue
+            is_code = True if not code_names else (name in code_names)
+            if not is_code:
+                continue
+            for sym in entries:
+                off = int(getattr(sym, "off", -1))
+                size = int(getattr(sym, "size", 0))
+                _mark_range(name, off, size)
+                has_ranges = True
+
+    if not has_ranges and isinstance(symbol_meta, dict):
+        for name, meta in symbol_meta.items():
+            is_code = True if not code_names else (name in code_names)
+            if not is_code:
+                continue
+            entries = meta if isinstance(meta, list) else [meta]
+            for ent in entries:
+                if not isinstance(ent, dict):
+                    continue
+                try:
+                    size = int(ent.get("size", 0) or 0)
+                except Exception:
+                    continue
+                if size <= 0:
+                    continue
+                off = None
+                if "addr" in ent:
+                    try:
+                        off = int(ent["addr"]) - flash_base
+                    except Exception:
+                        off = None
+                if off is None and "file_offset" in ent:
+                    try:
+                        off = int(ent["file_offset"])
+                    except Exception:
+                        off = None
+                if off is None and "off" in ent:
+                    try:
+                        off = int(ent["off"])
+                    except Exception:
+                        off = None
+                if off is None:
+                    continue
+                _mark_range(name, off, size)
+
+    code_bytes = sum(1 for flag in mask if flag)
+    if code_bytes == 0:
+        mask = None
+    else:
+        print(f"[GLOBAL] code-mask coverage {code_bytes} bytes ({code_bytes/new_len*100:.2f}%)")
+
+    func_prefix: Optional[List[int]] = None
+    if any(func_flags):
+        func_prefix = [0] * (new_len + 1)
+        acc = 0
+        for idx, flag in enumerate(func_flags):
+            if flag:
+                acc += 1
+            func_prefix[idx + 1] = acc
+
+    return mask, func_prefix
 
 def process_gap_region(
     old_bin: bytes,
@@ -888,10 +998,12 @@ def count_op_bytes_meta_data(patch_bytes):
         i += 1
         meta = 1  # 指令头部
         if op == OP_COPY:
-            for _ in range(2):
-                _, i2, l = read_uleb128(raw, i)
-                meta += l
-                i = i2
+            _, i2, l = read_uleb128(raw, i)
+            meta += l
+            i = i2
+            _, i2, l = read_uleb128(raw, i)
+            meta += l
+            i = i2
         elif op == OP_ADD:
             l, i2, llen = read_uleb128(raw, i)
             meta += llen
@@ -899,14 +1011,18 @@ def count_op_bytes_meta_data(patch_bytes):
             data_bytes[op_name] += l
             i += l
         elif op == OP_PATCH_FROM_OLD:
-            for _ in range(3):
-                _, i2, l = read_uleb128(raw, i)
-                meta += l
-                i = i2
-            nchanges = raw[i-1]
+            _, i2, l = read_uleb128(raw, i)
+            meta += l
+            i = i2
+            _, i2, l = read_uleb128(raw, i)
+            meta += l
+            i = i2
+            nchanges, i2, l = read_uleb128(raw, i)
+            meta += l
+            i = i2
             last = 0
             for _ in range(nchanges):
-                _, i2, l1 = read_uleb128(raw, i)
+                delta, i2, l1 = read_uleb128(raw, i)
                 meta += l1
                 i = i2
                 clen, i2, l2 = read_uleb128(raw, i)
@@ -914,22 +1030,27 @@ def count_op_bytes_meta_data(patch_bytes):
                 i = i2
                 data_bytes[op_name] += clen
                 i += clen
+                last += delta
         elif op == OP_PATCH_COMPACT:
-            for _ in range(3):
-                _, i2, l = read_uleb128(raw, i)
-                meta += l
-                i = i2
-            nchanges = raw[i-1]
-            if nchanges == 0:
-                pass
-            else:
+            _, i2, l = read_uleb128(raw, i)
+            meta += l
+            i = i2
+            _, i2, l = read_uleb128(raw, i)
+            meta += l
+            i = i2
+            nchanges, i2, l = read_uleb128(raw, i)
+            meta += l
+            i = i2
+            if nchanges > 0:
                 change_len, i2, llen = read_uleb128(raw, i)
                 meta += llen
                 i = i2
+                last = 0
                 for _ in range(nchanges):
-                    _, i2, l = read_uleb128(raw, i)
+                    delta, i2, l = read_uleb128(raw, i)
                     meta += l
                     i = i2
+                    last += delta
                 data_bytes[op_name] += nchanges * change_len
                 i += nchanges * change_len
         elif op == OP_FILL:
@@ -971,61 +1092,27 @@ def generate_patch_global_only(
     # 用于驱动匹配，而补丁发射阶段仍然使用真实字节。
     old_raw = None
     new_raw = None
+    old_parsed = {}
+    new_parsed = {}
     if old_sym_json and os.path.isfile(old_sym_json):
         try:
-            old_raw, _ = load_symbols_any(old_sym_json, None, flash_base, len(old_bin))
+            old_raw, old_parsed = load_symbols_any(old_sym_json, None, flash_base, len(old_bin))
         except Exception:
             old_raw = None
+            old_parsed = {}
     if new_sym_json and os.path.isfile(new_sym_json):
         try:
-            new_raw, _ = load_symbols_any(new_sym_json, None, flash_base, len(new_bin))
+            new_raw, new_parsed = load_symbols_any(new_sym_json, None, flash_base, len(new_bin))
         except Exception:
             new_raw = None
+            new_parsed = {}
 
-    # 利用符号的 \"type\" 元数据，为新镜像构建一个简单的代码/非代码掩码。
-    code_mask = None
-    func_start_prefix = None
-    if isinstance(new_raw, dict) and "symbols" in new_raw:
-        syms = new_raw.get("symbols", {})
-        if isinstance(syms, dict):
-            mask = [False] * new_len
-            func_start = [False] * new_len
-            for name, meta in syms.items():
-                if not isinstance(meta, dict):
-                    continue
-                if str(meta.get("type", "")).lower() != "code":
-                    continue
-                try:
-                    addr = int(meta.get("addr", 0) or 0)
-                    size = int(meta.get("size", 0) or 0)
-                except Exception:
-                    continue
-                if size <= 0:
-                    continue
-                off = addr - flash_base
-                if off < 0 or off >= new_len:
-                    continue
-                end = min(off + size, new_len)
-                # 标记代码字节
-                for i in range(off, end):
-                    mask[i] = True
-                # 启发式规则：如果这个符号看起来像真实函数，则将其视为函数起始。
-                if (
-                    end - off >= 16
-                    and not name.startswith("??")
-                    and not name.startswith("$")
-                ):
-                    func_start[off] = True
-            code_mask = mask
-            # 为函数起始位置构建前缀和，用于 DP 中的边界计数。
-            if any(func_start):
-                prefix = [0] * (new_len + 1)
-                acc = 0
-                for i, flag in enumerate(func_start):
-                    if flag:
-                        acc += 1
-                    prefix[i + 1] = acc
-                func_start_prefix = prefix
+    code_mask, func_start_prefix = _build_code_mask_from_symbols(
+        new_raw,
+        new_parsed,
+        new_len,
+        flash_base,
+    )
 
     if old_raw and new_raw:
         old_match_bytes = _build_normalized_stream_from_raw(

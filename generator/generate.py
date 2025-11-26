@@ -1076,9 +1076,11 @@ def main():
     g.add_argument('--out', required=True, help='输出补丁文件')
     g.add_argument('--frames', default=None, help='分片输出目录')
     g.add_argument('--frame-size', type=int, default=502, help='每片有效载荷字节数')
-    g.add_argument('--cdc', action='store_true', help='启用 CDC 匹配策略')
+    g.add_argument('--cdc', action='store_true', help='启用 CDC 匹配策略（仅高级模式）')
     g.add_argument('--arch-mode', default='auto', choices=['auto','thumb','arm','raw'], help='ARM 架构模式（自动/Thumb/ARM/raw）')
     g.add_argument('--endian', default='le', choices=['le','be'], help='端序（TMS570 多为 be）')
+    g.add_argument('--mode', default='global', choices=['global', 'advanced'],
+                   help='选择补丁生成模式：global（默认，全局语义匹配）或 advanced（原始语义差分路径）')
     g.add_argument('--reloc-aware', action='store_true', help='启用重定位/指令模式相似性判别')
     g.add_argument('--reloc-th', type=float, default=0.6, help='语义区进入阈值（0-1）')
     g.add_argument('--reloc-filter', action='store_true', help='当相似度低于阈值时丢弃语义区（默认不丢弃，仅调阈值）')
@@ -1093,19 +1095,32 @@ def main():
         print("[ERROR] --flash-base 格式错误", file=sys.stderr)
         sys.exit(2)
 
-    patch_bytes, stats = generate_patch(
-        args.old, args.new,
-        old_sym_json=args.old_sym, new_sym_json=args.new_sym,
-        old_map=args.old_map, new_map=args.new_map,
-        flash_base=flash_base,
-        use_cdc=args.cdc,
-        arch_mode=args.arch_mode,
-        reloc_aware=args.reloc_aware,
-        reloc_th=args.reloc_th,
-        reloc_filter=args.reloc_filter,
-        reloc_debug=args.reloc_debug,
-        endian=args.endian
-    )
+    if args.mode == 'global':
+        print("[MODE] 使用 global 语义匹配路径（首选）")
+        patch_bytes, stats = generate_patch_global_only(
+            args.old,
+            args.new,
+            old_sym_json=args.old_sym,
+            new_sym_json=args.new_sym,
+            flash_base=flash_base,
+            arch_mode=args.arch_mode,
+            endian=args.endian,
+        )
+    else:
+        print("[MODE] 使用 advanced 语义差分路径")
+        patch_bytes, stats = generate_patch(
+            args.old, args.new,
+            old_sym_json=args.old_sym, new_sym_json=args.new_sym,
+            old_map=args.old_map, new_map=args.new_map,
+            flash_base=flash_base,
+            use_cdc=args.cdc,
+            arch_mode=args.arch_mode,
+            reloc_aware=args.reloc_aware,
+            reloc_th=args.reloc_th,
+            reloc_filter=args.reloc_filter,
+            reloc_debug=args.reloc_debug,
+            endian=args.endian
+        )
     with open(args.out, 'wb') as f:
         f.write(patch_bytes)
     print(f"[OK] 补丁已生成: {args.out}, 长度 {len(patch_bytes)} bytes")
@@ -1259,6 +1274,9 @@ def main():
             print("[VERIFY] OK: apply_patch 重建与新固件一致")
         else:
             print("[VERIFY] FAIL: apply_patch 重建与新固件不一致")
+            if args.mode == 'global':
+                print("[VERIFY] 已在 global 模式下，无法继续回退。")
+                sys.exit(2)
             # 自动回退到全局 COPY+ADD 补丁，但这一次带上符号 / 段信息，启用归一化与 code-aware DP。
             print("[VERIFY] fallback: 尝试使用全局匹配生成的简单补丁 (global-only)")
             patch_bytes2, stats2 = generate_patch_global_only(

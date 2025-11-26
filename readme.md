@@ -60,7 +60,7 @@ python -m generator.generate gen \
 Notes:
 - `--mode global` is now the default/preferred global semantic path (advanced mode remains available for experiments via `--mode advanced`).
 - `--verify` runs `apply_patch.py` locally to ensure the patch reconstructs the new firmware; if it fails in global mode, the process stops without fallback (advanced mode falls back to global-only automatically).
-- Adjust `--arch-mode` / `--endian` per your target (QLS uses ARM big-endian; USB CDC uses ARM little-endian).
+- Adjust `--arch-mode`(arm/thumb) / `--endian`(little end/big end) per your target.
 
 #### 3. Optional: Simulate patch application (RAM/time estimates)
 
@@ -148,7 +148,7 @@ python -m generator.generate gen \
 说明：
 - `--mode global` 现为默认/推荐的全局语义路径；若需实验，可通过 `--mode advanced` 启用高级模式。
 - `--verify` 会运行 `apply_patch.py` 来确认补丁可重建新固件；若在 global 模式失败，流程会直接终止（advanced 模式会自动回退到全局流程）。
-- 请根据目标 MCU 调整 `--arch-mode` / `--endian`（QLS 为 ARM 大端，USB CDC 为 ARM 小端）。
+- 请根据目标 MCU 调整 `--arch-mode`(arm/thumb) / `--endian`(大端或小端)。
 
 #### 3. 可选：仿真补丁应用（RAM/耗时评估）
 

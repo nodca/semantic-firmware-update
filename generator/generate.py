@@ -12,7 +12,13 @@ from tqdm import tqdm
 
 from generator.strategies.global_match import global_greedy_hybrid
 from generator.strategies.global_dp import global_dp_hybrid
-from generator.core.protocol import PatchBuilder, OP_ADD, OP_COPY
+from generator.core.protocol import (
+    PatchBuilder,
+    OP_ADD,
+    OP_COPY,
+    estimate_add_bytes,
+    estimate_copy_bytes,
+)
 from generator.parsers.symbols import load_symbols_any, pair_symbols, safe_merge_symbol_regions
 from generator.strategies.cdc import cdc_emit_region, build_cdc_index
 from generator.strategies.greedy import build_block_index, greedy_match
@@ -32,6 +38,20 @@ from generator.analysis.simlite import (
 )
 from generator.core.utils import uleb128_len
 
+MIN_COPY_SAVING = 2  # require COPY to save at least 2 bytes vs literal
+
+
+def _speed_profile_kwargs(profile: str) -> dict:
+    """Return global_dp_hybrid tuning knobs for the desired speed profile."""
+    if profile == "fast":
+        return {
+            "skip_local_if_cover": 0.90,
+            "greedy_block": 48,
+            "greedy_index_step": 8,
+            "greedy_min_run": 24,
+            "greedy_scan_step": 8,
+        }
+    return {}
 
 def _build_normalized_stream_from_raw(
     bin_bytes: bytes,
@@ -155,20 +175,29 @@ def process_gap_region(
     for (n_off_rel, o_off_m, ln) in matches:
         if n_off_rel < 0 or o_off_m < 0 or ln <= 0:
             continue
-            
+
         if n_off_rel > cur:
             add_len = n_off_rel - cur
             if add_len > 0:
                 add_data += add_len
-                add_meta += 1 + uleb128_len(add_len)  # OP_ADD 指令自身 + 长度编码开销
+                add_meta += 1 + uleb128_len(add_len)
                 add_count += 1
                 emit_literals(pb, new_region[cur:n_off_rel])
-        # COPY指令只有元数据，没有数据负载
-        copy_meta += 1 + uleb128_len(o_off_m) + uleb128_len(ln)  # OP_COPY 指令自身 + 2 个参数开销
-        copy_count += 1
-        pb.op_copy(o_off_m, ln)
+            cur = n_off_rel
+
+        copy_cost = estimate_copy_bytes(o_off_m, ln)
+        add_cost = estimate_add_bytes(ln)
+        if copy_cost + MIN_COPY_SAVING <= add_cost:
+            copy_meta += copy_cost
+            copy_count += 1
+            pb.op_copy(o_off_m, ln)
+        else:
+            literal = new_region[cur:cur + ln]
+            add_data += len(literal)
+            add_meta += 1 + uleb128_len(len(literal))
+            add_count += 1
+            emit_literals(pb, literal)
         cur = n_off_rel + ln
-    
     if cur < len(new_region):
         add_len = len(new_region) - cur
         if add_len > 0:
@@ -926,6 +955,7 @@ def generate_patch_global_only(
     flash_base: int = 0,
     arch_mode: str = "arm",
     endian: str = "le",
+    speed_profile: str = "balanced",
 ) -> Tuple[bytes, dict]:
     """
     仅使用全局匹配的基线版本：忽略符号 / 重定位信息，
@@ -1010,12 +1040,14 @@ def generate_patch_global_only(
         new_match_bytes = new_bin
         print(f"[GLOBAL] using global_dp_hybrid, min_match_len={min_match_len}")
 
+    speed_kwargs = _speed_profile_kwargs(speed_profile)
     matches = global_dp_hybrid(
         old_match_bytes,
         new_match_bytes,
         min_length=min_match_len,
         code_mask=code_mask,
         func_boundary_prefix=func_start_prefix,
+        **speed_kwargs,
     )
 
     pb = PatchBuilder(new_len)
@@ -1087,6 +1119,8 @@ def main():
     g.add_argument('--reloc-debug', action='store_true', help='打印相似度分项以便诊断')
     g.add_argument("--verify", action="store_true", help="生成后用设备端应用器校验（apply_patch.py）")
     g.add_argument("--payload", type=int, default=502, help="校验时模拟设备端每片有效载荷字节数，默认 502")
+    g.add_argument('--speed-profile', default='balanced', choices=['balanced', 'fast'],
+                   help='速度/体积权衡：balanced（默认）或 fast（更快生成，可能轻微增大补丁）')
 
     args = ap.parse_args()
     try:

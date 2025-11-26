@@ -1,5 +1,5 @@
 from typing import List, Tuple, Optional
-from generator.core.utils import uleb128_len
+from generator.core.protocol import estimate_add_bytes, estimate_copy_bytes
 from .global_match import find_global_matches
 from .greedy import greedy_match, build_block_index
 
@@ -45,9 +45,10 @@ def _choose_best_cover(
         if ln <= 0:
             continue
         end = n_off + ln
-        # 估算 COPY 指令的元数据开销：1 字节操作码 + ULEB128(old_off) + ULEB128(length)
-        meta_cost = 1 + uleb128_len(o_off) + uleb128_len(ln)
-        weight = ln - meta_cost
+        # 基于 PatchBuilder 的 COPY/ADD 字节开销估算
+        copy_bytes = estimate_copy_bytes(o_off, ln)
+        add_bytes = estimate_add_bytes(ln)
+        weight = add_bytes - copy_bytes
         if code_prefix is not None:
             # 对 new_bytes 中落在代码区的字节给予一些额外加分。
             inside = code_prefix[end] - code_prefix[n_off]
@@ -118,6 +119,12 @@ def global_dp_hybrid(
     min_length: int = 32,
     code_mask: Optional[List[bool]] = None,
     func_boundary_prefix: Optional[List[int]] = None,
+    *,
+    greedy_block: int = 32,
+    greedy_index_step: int = 4,
+    greedy_min_run: int = 16,
+    greedy_scan_step: int = 4,
+    skip_local_if_cover: Optional[float] = None,
 ) -> List[Tuple[int, int, int]]:
     """
     全局 + 局部混合匹配器，使用 DP 选择最优的不重叠覆盖：
@@ -143,10 +150,28 @@ def global_dp_hybrid(
         print(f"[GLOBAL-COVERAGE] global_matches={len(global_matches)} "
               f"covered={cov_g} ({cov_g/new_len*100:.2f}%)")
 
-    # 3) 局部贪心匹配
-    block_idx = build_block_index(old_bytes, block=32, step=4)
-    local_matches = greedy_match(old_bytes, new_bytes, block_idx,
-                                 block=32, min_run=16, scan_step=4)
+    # 3) 局部贪心匹配（根据覆盖率和配置可跳过）
+    local_matches: List[Tuple[int, int, int]] = []
+    skip_local = False
+    if skip_local_if_cover is not None and new_len > 0:
+        cov_ratio = cov_g / new_len if new_len else 0.0
+        if cov_ratio >= skip_local_if_cover:
+            skip_local = True
+            print(
+                f"[GLOBAL] coverage {cov_ratio*100:.2f}% >= {skip_local_if_cover*100:.1f}%, "
+                "skip greedy pass for speed"
+            )
+
+    if not skip_local:
+        block_idx = build_block_index(old_bytes, block=greedy_block, step=greedy_index_step)
+        local_matches = greedy_match(
+            old_bytes,
+            new_bytes,
+            block_idx,
+            block=greedy_block,
+            min_run=greedy_min_run,
+            scan_step=greedy_scan_step,
+        )
 
     # 4) 在所有候选上做 DP 选择
     all_matches = global_matches + local_matches

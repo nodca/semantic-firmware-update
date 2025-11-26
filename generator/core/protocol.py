@@ -1,7 +1,7 @@
 import struct
 import zlib
 from typing import List, Tuple, Union
-from .utils import uleb128_encode
+from .utils import uleb128_encode, uleb128_len
 
 # 指令格式
 OP_END = 0x00
@@ -17,34 +17,39 @@ HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 # 指令中间表示
 class CopyOp:
-    def __init__(self, old_off: int, length: int):
+    def __init__(self, old_off: int, length: int, new_off: int):
         self.old_off = old_off
         self.length = length
+        self.new_off = new_off
         self.type = 'COPY'
 
 class AddOp:
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes, new_off: int):
         self.data = data
+        self.new_off = new_off
         self.type = 'ADD'
 
 class FillOp:
-    def __init__(self, byte_val: int, length: int):
-        self.byte_val = byte_val
+    def __init__(self, byte_val: int, length: int, new_off: int):
+        self.byte_val = byte_val & 0xFF
         self.length = length
+        self.new_off = new_off
         self.type = 'FILL'
 
 class PatchOp:
-    def __init__(self, old_off: int, length: int, changes: List[Tuple[int, bytes]]):
+    def __init__(self, old_off: int, length: int, changes: List[Tuple[int, bytes]], new_off: int):
         self.old_off = old_off
         self.length = length
         self.changes = changes
+        self.new_off = new_off
         self.type = 'PATCH'
 
 class PatchCompactOp:
-    def __init__(self, old_off: int, length: int, changes: List[Tuple[int, bytes]]):
+    def __init__(self, old_off: int, length: int, changes: List[Tuple[int, bytes]], new_off: int):
         self.old_off = old_off
         self.length = length
         self.changes = changes
+        self.new_off = new_off
         self.type = 'PATCH_COMPACT'
 
 class PatchBuilder:
@@ -53,6 +58,10 @@ class PatchBuilder:
         self.stats = {'COPY':0, 'ADD':0, 'PATCH':0, 'FILL':0, 'PATCH_COMPACT':0}
         self._pending_add = bytearray()
         self.instructions = []  # 存储中间表示的指令
+        self._meta_bytes = HEADER_SIZE  # 预先包含头部
+        self._data_bytes = 0
+        self._terminal_overhead = 1  # OP_END
+        self._new_pos = 0
         
     def header(self):
         # 头部信息暂不处理，在最终编码时添加
@@ -60,12 +69,12 @@ class PatchBuilder:
 
     def current_size(self):
         """返回当前补丁已编码的字节数（未压缩）"""
-        # 只编码当前指令，不做优化和压缩
-        return len(self._encode_instructions())
+        return self._meta_bytes + self._data_bytes + self._terminal_overhead
 
     def flush_add(self):
         if self._pending_add:
-            self.instructions.append(AddOp(bytes(self._pending_add)))
+            data = bytes(self._pending_add)
+            self._append_add(data)
             self.stats['ADD'] += 1
             self._pending_add.clear()
 
@@ -75,7 +84,7 @@ class PatchBuilder:
 
     def op_copy(self, old_off: int, length: int):
         self.flush_add()
-        self.instructions.append(CopyOp(old_off, length))
+        self._append_copy(old_off, length)
         self.stats['COPY'] += 1
 
     def op_add(self, data: bytes):
@@ -83,17 +92,17 @@ class PatchBuilder:
 
     def op_fill(self, byte_val: int, length: int):
         self.flush_add()
-        self.instructions.append(FillOp(byte_val, length))
+        self._append_fill(byte_val, length)
         self.stats['FILL'] += 1
 
     def op_patch_from_old(self, old_off: int, length: int, changes: List[Tuple[int, bytes]]):
         self.flush_add()
-        self.instructions.append(PatchOp(old_off, length, changes))
+        self._append_patch(old_off, length, changes)
         self.stats['PATCH'] += 1
 
     def op_patch_compact(self, old_off: int, length: int, changes: List[Tuple[int, bytes]]):
         self.flush_add()
-        self.instructions.append(PatchCompactOp(old_off, length, changes))
+        self._append_patch_compact(old_off, length, changes)
         self.stats['PATCH_COMPACT'] += 1
 
     def end(self):
@@ -105,7 +114,7 @@ class PatchBuilder:
         self.flush_add()
         if not data:
             return
-        self.instructions.append(AddOp(bytes(data)))
+        self._append_add(bytes(data))
         self.stats['ADD'] += 1
 
     def _optimize_instructions(self):
@@ -120,15 +129,15 @@ class PatchBuilder:
             current = self.instructions[i]
             
             # 合并连续的COPY指令
-            if isinstance(current, CopyOp) :
+            if isinstance(current, CopyOp):
                 copies_to_merge = [current]
                 j = i + 1
                 
                 while j < len(self.instructions) and isinstance(self.instructions[j], CopyOp):
                     next_copy = self.instructions[j]
-                    # 检查是否连续（在旧固件和新固件中都连续）
-                    if (next_copy.old_off == current.old_off + sum(c.length for c in copies_to_merge) and
-                        self._is_contiguous_in_new_firmware(copies_to_merge + [next_copy])):
+                    expected_new = copies_to_merge[-1].new_off + copies_to_merge[-1].length
+                    expected_old = copies_to_merge[-1].old_off + copies_to_merge[-1].length
+                    if next_copy.old_off == expected_old and next_copy.new_off == expected_new:
                         copies_to_merge.append(next_copy)
                         j += 1
                     else:
@@ -137,7 +146,7 @@ class PatchBuilder:
                 if len(copies_to_merge) > 1:
                     # 合并所有连续的COPY
                     total_length = sum(copy.length for copy in copies_to_merge)
-                    optimized.append(CopyOp(current.old_off, total_length))
+                    optimized.append(CopyOp(current.old_off, total_length, current.new_off))
                     i = j
                 else:
                     # 检查是否需要将短COPY转为ADD
@@ -161,7 +170,7 @@ class PatchBuilder:
                 if len(adds_to_merge) > 1:
                     # 合并所有连续的ADD
                     merged_data = b''.join(add.data for add in adds_to_merge)
-                    optimized.append(AddOp(merged_data))
+                    optimized.append(AddOp(merged_data, current.new_off))
                     i = j
                 else:
                     optimized.append(current)
@@ -175,13 +184,6 @@ class PatchBuilder:
         self.instructions = optimized
         # 重新统计指令数量
         self._recount_stats()
-    
-    def _is_contiguous_in_new_firmware(self, copies):
-        """检查COPY指令在新固件中是否连续"""
-        # 这里需要知道每个COPY在新固件中的位置
-        # 由于我们按顺序生成指令，这个信息在生成时丢失了
-        # 简化处理：假设连续的COPY在新固件中也是连续的
-        return True
     
     def _recount_stats(self):
         """重新统计指令数量"""
@@ -266,3 +268,71 @@ class PatchBuilder:
         if compress:
             return zlib.compress(raw, level=9)
         return raw
+
+    # ---------- Internal helpers for size tracking ----------
+    def _advance_new_cursor(self, length: int):
+        self._new_pos += length
+
+    def _record_size(self, meta: int, data: int = 0):
+        self._meta_bytes += meta
+        self._data_bytes += data
+
+    def _append_copy(self, old_off: int, length: int):
+        self.instructions.append(CopyOp(old_off, length, self._new_pos))
+        self._record_size(1 + uleb128_len(old_off) + uleb128_len(length))
+        self._advance_new_cursor(length)
+
+    def _append_add(self, data: bytes):
+        literal_len = len(data)
+        self.instructions.append(AddOp(data, self._new_pos))
+        self._record_size(1 + uleb128_len(literal_len), literal_len)
+        self._advance_new_cursor(literal_len)
+
+    def _append_fill(self, byte_val: int, length: int):
+        self.instructions.append(FillOp(byte_val, length, self._new_pos))
+        self._record_size(1 + uleb128_len(byte_val & 0xFF) + uleb128_len(length))
+        self._advance_new_cursor(length)
+
+    def _append_patch(self, old_off: int, length: int, changes: List[Tuple[int, bytes]]):
+        self.instructions.append(PatchOp(old_off, length, changes, self._new_pos))
+        meta = 1 + uleb128_len(old_off) + uleb128_len(length) + uleb128_len(len(changes))
+        data_bytes = 0
+        last = 0
+        for off, chunk in changes:
+            delta = off - last
+            meta += uleb128_len(delta) + uleb128_len(len(chunk))
+            data_bytes += len(chunk)
+            last = off
+        self._record_size(meta, data_bytes)
+        self._advance_new_cursor(length)
+
+    def _append_patch_compact(self, old_off: int, length: int, changes: List[Tuple[int, bytes]]):
+        self.instructions.append(PatchCompactOp(old_off, length, changes, self._new_pos))
+        meta = 1 + uleb128_len(old_off) + uleb128_len(length) + uleb128_len(len(changes))
+        data_bytes = 0
+        if changes:
+            change_len = len(changes[0][1])
+            meta += uleb128_len(change_len)
+            last = 0
+            for off, _chunk in changes:
+                delta = off - last
+                meta += uleb128_len(delta)
+                last = off
+            data_bytes = change_len * len(changes)
+        self._record_size(meta, data_bytes)
+        self._advance_new_cursor(length)
+
+
+def estimate_copy_bytes(old_off: int, length: int) -> int:
+    """
+    估算一条 COPY 指令的补丁占用（仅元数据字节）。
+    与 PatchBuilder 内部统计保持一致。
+    """
+    return 1 + uleb128_len(old_off) + uleb128_len(length)
+
+
+def estimate_add_bytes(length: int) -> int:
+    """
+    估算一条 ADD 指令的总补丁大小（元数据 + literal 数据）。
+    """
+    return 1 + uleb128_len(length) + length

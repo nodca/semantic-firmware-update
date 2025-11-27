@@ -554,3 +554,4 @@ def safe_merge_symbol_regions(pairs: List[Tuple[int, int, int]],
         print(f"[MERGE-WARNING] 符号区域合并失败: {e}")
         print(f"[MERGE-WARNING] 使用原始符号区域: {len(pairs)} 个区域")
         return pairs  # 失败时回退到原始区域
+#

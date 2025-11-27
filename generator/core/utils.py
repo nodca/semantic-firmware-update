@@ -1,3 +1,6 @@
+from typing import Tuple
+
+
 def uleb128_encode(n: int) -> bytes:
     if n < 0:
         raise ValueError("uleb128 only supports non-negative integers")
@@ -12,6 +15,7 @@ def uleb128_encode(n: int) -> bytes:
             break
     return bytes(out)
 
+
 def uleb128_len(n: int) -> int:
     if n < 0:
         raise ValueError("uleb128 only supports non-negative integers")
@@ -23,11 +27,9 @@ def uleb128_len(n: int) -> int:
         n >>= 7
     return l
 
-from typing import Tuple
-
 
 def uleb128_decode(buf: bytes, i: int) -> Tuple[int, int, int]:
-    """解码 uleb128，返回 (值, 新位置, 长度)"""
+    """Decode uleb128; return (value, new_index, length)."""
     val = 0
     shift = 0
     start = i

@@ -10,6 +10,7 @@ OP_ADD = 0x02
 OP_PATCH_FROM_OLD = 0x04
 OP_FILL = 0x06
 OP_PATCH_COMPACT = 0x07
+OP_COPY_RELOC = 0x08
 
 MAGIC = b'DPT1'
 HEADER_FMT = '<4sHII'
@@ -52,10 +53,18 @@ class PatchCompactOp:
         self.new_off = new_off
         self.type = 'PATCH_COMPACT'
 
+class CopyRelocOp:
+    def __init__(self, old_off: int, length: int, relocs: List[Tuple[int, bytes]], new_off: int):
+        self.old_off = old_off
+        self.length = length
+        self.relocs = relocs
+        self.new_off = new_off
+        self.type = 'COPY_RELOC'
+
 class PatchBuilder:
     def __init__(self, target_size: int):
         self.target_size = target_size
-        self.stats = {'COPY':0, 'ADD':0, 'PATCH':0, 'FILL':0, 'PATCH_COMPACT':0}
+        self.stats = {'COPY':0, 'COPY_RELOC':0, 'ADD':0, 'PATCH':0, 'FILL':0, 'PATCH_COMPACT':0}
         self._pending_add = bytearray()
         self.instructions = []  # 存储中间表示的指令
         self._meta_bytes = HEADER_SIZE  # 预先包含头部
@@ -86,6 +95,11 @@ class PatchBuilder:
         self.flush_add()
         self._append_copy(old_off, length)
         self.stats['COPY'] += 1
+
+    def op_copy_reloc(self, old_off: int, length: int, relocs: List[Tuple[int, int]]):
+        self.flush_add()
+        self._append_copy_reloc(old_off, length, relocs)
+        self.stats['COPY_RELOC'] += 1
 
     def op_add(self, data: bytes):
         self._emit_add_raw(data)
@@ -187,7 +201,7 @@ class PatchBuilder:
     
     def _recount_stats(self):
         """重新统计指令数量"""
-        self.stats = {'COPY':0, 'ADD':0, 'PATCH':0, 'FILL':0, 'PATCH_COMPACT':0}
+        self.stats = {'COPY':0, 'COPY_RELOC':0, 'ADD':0, 'PATCH':0, 'FILL':0, 'PATCH_COMPACT':0}
         for instr in self.instructions:
             if isinstance(instr, CopyOp):
                 self.stats['COPY'] += 1
@@ -199,6 +213,8 @@ class PatchBuilder:
                 self.stats['PATCH'] += 1
             elif isinstance(instr, PatchCompactOp):
                 self.stats['PATCH_COMPACT'] += 1
+            elif isinstance(instr, CopyRelocOp):
+                self.stats['COPY_RELOC'] += 1
     
     def _encode_instructions(self):
         """将中间表示的指令编码为二进制"""
@@ -249,9 +265,19 @@ class PatchBuilder:
                         delta = off - last
                         buf += uleb128_encode(delta)
                         last = off
-                    
+
                     for _, chunk in instr.changes:
                         buf += chunk
+            elif isinstance(instr, CopyRelocOp):
+                buf.append(OP_COPY_RELOC)
+                buf += uleb128_encode(instr.old_off)
+                buf += uleb128_encode(instr.length)
+                buf += uleb128_encode(len(instr.relocs))
+                last = 0
+                for off, data in instr.relocs:
+                    buf += uleb128_encode(off - last)
+                    buf += data
+                    last = off
         
         # 添加结束指令
         buf.append(OP_END)
@@ -320,6 +346,16 @@ class PatchBuilder:
                 last = off
             data_bytes = change_len * len(changes)
         self._record_size(meta, data_bytes)
+        self._advance_new_cursor(length)
+
+    def _append_copy_reloc(self, old_off: int, length: int, relocs: List[Tuple[int, bytes]]):
+        self.instructions.append(CopyRelocOp(old_off, length, relocs, self._new_pos))
+        meta = 1 + uleb128_len(old_off) + uleb128_len(length) + uleb128_len(len(relocs))
+        last = 0
+        for off, _ in relocs:
+            meta += uleb128_len(off - last) + 4
+            last = off
+        self._record_size(meta, 0)
         self._advance_new_cursor(length)
 
 

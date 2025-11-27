@@ -82,10 +82,12 @@ def find_arm_branch_sites(code: bytes, endian: str = "le") -> Set[int]:
 
 # ---------------- 指针样点与掩蔽 ----------------
 def find_ptr_sites(code: bytes, flash_lo: int, flash_hi: int,
-                   sram: Tuple[int, int] = SRAM_DEFAULT, endian: str = "le") -> Set[int]:
+                   sram: Tuple[int, int] = SRAM_DEFAULT, endian: str = "le",
+                   base_offset: int = 0) -> Set[int]:
     sites: Set[int] = set()
     n = len(code)
-    for i in range(0, n - 3, 4):  # 4 字节对齐
+    start = (-base_offset) & 3  # 对齐到全局偏移对应的 4 字节边界
+    for i in range(start, n - 3, 4):  # 4 字节对齐
         w = _read_u32(code, i, endian)
         if flash_lo <= w < flash_hi or (sram[0] <= w < sram[1]):
             sites.add(i)

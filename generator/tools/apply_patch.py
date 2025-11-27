@@ -22,6 +22,7 @@ OP_PATCH_FROM_OLD = 0x04# old_off,varint ; length,varint ; nchanges,varint ; [de
 OP_ADD_LZ4 = 0x05       # ulen,varint ; clen,varint ; cdata (不支持)
 OP_FILL = 0x06          # byte,varint ; length,varint（重复某个字节）
 OP_PATCH_COMPACT = 0x07 # old_off,varint ; length,varint ; nchanges,varint ; change_len,varint ; [delta]... ; [data]...（压缩表示的补丁）
+OP_COPY_RELOC = 0x08    # old_off,varint ; length,varint ; nrelocs,varint ; [delta_off,varint ; delta_val,sleb128]...
 
 class Stream:
     """流式读取器，最小内存占用"""
@@ -60,6 +61,7 @@ class Stream:
             if shift > 35:
                 raise ValueError("uleb128 too large or malformed")
         return result
+
 
 def apply_patch_in_memory(old_bytes: bytes, patch_data: bytes):
     """内存中应用补丁"""
@@ -150,6 +152,25 @@ def apply_patch_in_memory(old_bytes: bytes, patch_data: bytes):
                     data_ptr += change_len
                     last_off = off_in_block
             
+            out[pos:pos+length] = block
+            pos += length
+
+        elif op == OP_COPY_RELOC:
+            old_off = s.read_uleb128()
+            length  = s.read_uleb128()
+            nrelocs = s.read_uleb128()
+            if old_off + length > old_len or pos + length > target_size:
+                raise ValueError("COPY_RELOC out of range")
+            block = bytearray(old_bytes[old_off:old_off+length])
+            last_off = 0
+            for _ in range(nrelocs):
+                delta = s.read_uleb128()
+                rel_off = last_off + delta
+                if rel_off + 4 > length:
+                    raise ValueError("COPY_RELOC slot out of range")
+                new_bytes = s.read_exact(4)
+                block[rel_off:rel_off+4] = new_bytes
+                last_off = rel_off
             out[pos:pos+length] = block
             pos += length
 

@@ -471,8 +471,8 @@ def diff_symbol_region_reloc(
 
     # 1) 收集所有“类似重定位”的字节位置（范围在 [0, size) 内）。
     reloc_bytes = set()
-    ptr_o = find_ptr_sites(olds, flash_lo, flash_hi, endian=endian)
-    ptr_n = find_ptr_sites(news, flash_lo, flash_hi, endian=endian)
+    ptr_o = find_ptr_sites(olds, flash_lo, flash_hi, endian=endian, base_offset=old_off)
+    ptr_n = find_ptr_sites(news, flash_lo, flash_hi, endian=endian, base_offset=new_off)
     for off in ptr_o | ptr_n:
         for k in range(off, min(off + 4, size)):
             reloc_bytes.add(k)
@@ -508,7 +508,32 @@ def diff_symbol_region_reloc(
     return changes
 
 
-def _try_reloc_patch_if_norm_equal(
+def _changes_to_reloc_descriptors(
+    changes: List[Tuple[int, bytes]],
+    old_bytes: bytes,
+    new_bytes: bytes,
+    old_off: int,
+    new_off: int,
+    endian: str,
+) -> Optional[List[Tuple[int, bytes]]]:
+    if not changes:
+        return []
+    relocs: List[Tuple[int, bytes]] = []
+    for start, data in changes:
+        if len(data) % 4 != 0 or start % 4 != 0:
+            return None
+        for idx in range(0, len(data), 4):
+            off = start + idx
+            o_pos = old_off + off
+            n_pos = new_off + off
+            if o_pos + 4 > len(old_bytes) or n_pos + 4 > len(new_bytes):
+                return None
+            relocs.append((off, new_bytes[n_pos:n_pos + 4]))
+    relocs.sort(key=lambda x: x[0])
+    return relocs
+
+
+def _try_detect_reloc_descriptors(
     old_bytes: bytes,
     new_bytes: bytes,
     old_norm: Optional[bytes],
@@ -519,7 +544,65 @@ def _try_reloc_patch_if_norm_equal(
     flash_lo: int,
     flash_hi: int,
     endian: str,
+    *,
+    require_norm: bool = False,
+    max_ratio: float = 0.7,
 ) -> Optional[List[Tuple[int, bytes]]]:
+    if size <= 0:
+        return None
+    if require_norm:
+        if (
+            old_norm is None
+            or new_norm is None
+            or old_off < 0
+            or new_off < 0
+            or old_off + size > len(old_norm)
+            or new_off + size > len(new_norm)
+        ):
+            return None
+        if old_norm[old_off:old_off + size] != new_norm[new_off:new_off + size]:
+            return None
+    try:
+        changes = diff_symbol_region_reloc(
+            old_bytes,
+            new_bytes,
+            old_off,
+            new_off,
+            size,
+            flash_lo,
+            flash_hi,
+            endian=endian,
+            max_changes=max(128, size // 3),
+            max_ratio=max_ratio,
+        )
+    except Exception:
+        return None
+    if changes is None:
+        return None
+    if len(changes) == 0:
+        return []
+    return _changes_to_reloc_descriptors(
+        changes,
+        old_bytes,
+        new_bytes,
+        old_off,
+        new_off,
+        endian,
+    )
+
+
+def _try_build_reloc_descriptors(
+    old_bytes: bytes,
+    new_bytes: bytes,
+    old_norm: Optional[bytes],
+    new_norm: Optional[bytes],
+    old_off: int,
+    new_off: int,
+    size: int,
+    flash_lo: int,
+    flash_hi: int,
+    endian: str,
+) -> Optional[List[Tuple[int, int]]]:
     if (
         size <= 0
         or old_norm is None
@@ -533,7 +616,7 @@ def _try_reloc_patch_if_norm_equal(
     if old_norm[old_off:old_off + size] != new_norm[new_off:new_off + size]:
         return None
     try:
-        return diff_symbol_region_reloc(
+        changes = diff_symbol_region_reloc(
             old_bytes,
             new_bytes,
             old_off,
@@ -547,6 +630,11 @@ def _try_reloc_patch_if_norm_equal(
         )
     except Exception:
         return None
+    if changes is None:
+        return None
+    if len(changes) == 0:
+        return []
+    return _changes_to_reloc_descriptors(changes, old_bytes, new_bytes, old_off, new_off, endian)
 
 
 def _estimate_patch_cost(old_off: int, size: int, changes: List[Tuple[int, bytes]]) -> int:
@@ -586,6 +674,7 @@ def generate_patch(old_path: str, new_path: str,
         new_bin = f.read()
     old_len = len(old_bin)
     new_len = len(new_bin)
+    flash_hi = flash_base + max(len(old_bin), len(new_bin))
     flash_hi = flash_base + max(len(old_bin), len(new_bin))
     target_size = new_len
     flash_lo = flash_base
@@ -863,10 +952,22 @@ def generate_patch(old_path: str, new_path: str,
             # 处理语义区
             start_size = pb.current_size()
             before_add = pb.stats['ADD']
-            before_copy = pb.stats['COPY']
+            before_copy = pb.stats['COPY'] + pb.stats.get('COPY_RELOC', 0)
             changes = region['changes']
-            if changes is None:
-                changes = _try_reloc_patch_if_norm_equal(
+            reloc_desc: Optional[List[Tuple[int, int]]] = None
+            if changes:
+                reloc_desc = _changes_to_reloc_descriptors(
+                    changes,
+                    old_bin,
+                    new_bin,
+                    region['old_offset'],
+                    region['start'],
+                    endian,
+                )
+                if reloc_desc is not None:
+                    changes = None
+            if reloc_desc is None:
+                reloc_desc = _try_detect_reloc_descriptors(
                     old_bin,
                     new_bin,
                     match_old,
@@ -877,15 +978,36 @@ def generate_patch(old_path: str, new_path: str,
                     flash_lo,
                     flash_hi,
                     endian,
+                    require_norm=True,
                 )
-            emit_best_for_region(
-                pb,
-                region['old_offset'],
-                new_bin[region['start']:region['start'] + region['size']],
-                changes,
-            )
+            if reloc_desc is None:
+                reloc_desc = _try_detect_reloc_descriptors(
+                    old_bin,
+                    new_bin,
+                    None,
+                    None,
+                    region['old_offset'],
+                    region['start'],
+                    region['size'],
+                    flash_lo,
+                    flash_hi,
+                    endian,
+                    require_norm=False,
+                )
+            if reloc_desc is not None:
+                if reloc_desc:
+                    pb.op_copy_reloc(region['old_offset'], region['size'], reloc_desc)
+                else:
+                    pb.op_copy(region['old_offset'], region['size'])
+            else:
+                emit_best_for_region(
+                    pb,
+                    region['old_offset'],
+                    new_bin[region['start']:region['start'] + region['size']],
+                    changes,
+                )
             semantic_add_count += pb.stats['ADD'] - before_add
-            semantic_copy_count += pb.stats['COPY'] - before_copy
+            semantic_copy_count += (pb.stats['COPY'] + pb.stats.get('COPY_RELOC', 0) - before_copy)
             non_gap_bytes += pb.current_size() - start_size
 
     if use_cdc:
@@ -943,7 +1065,7 @@ def _verify_with_apply(old_path: str, new_path: str, patch_path: str, payload: i
 
 def count_op_bytes(patch_bytes):
     import zlib
-    from generator.core.protocol import OP_COPY, OP_ADD, OP_PATCH_FROM_OLD, OP_FILL, OP_PATCH_COMPACT, OP_END, HEADER_SIZE
+    from generator.core.protocol import OP_COPY, OP_ADD, OP_PATCH_FROM_OLD, OP_FILL, OP_PATCH_COMPACT, OP_COPY_RELOC, OP_END, HEADER_SIZE
     try:
         raw = zlib.decompress(patch_bytes)
     except Exception:
@@ -954,6 +1076,7 @@ def count_op_bytes(patch_bytes):
         OP_PATCH_FROM_OLD: "PATCH",
         OP_FILL: "FILL",
         OP_PATCH_COMPACT: "PATCH_COMPACT",
+        OP_COPY_RELOC: "COPY_RELOC",
     }
     def read_uleb128(raw, i):
         val = 0
@@ -967,6 +1090,21 @@ def count_op_bytes(patch_bytes):
             if not (b & 0x80):
                 break
         return val, i, i - start
+    def read_sleb128(raw, i):
+        result = 0
+        shift = 0
+        start = i
+        size = 64
+        while True:
+            b = raw[i]
+            i += 1
+            result |= ((b & 0x7F) << shift)
+            shift += 7
+            if (b & 0x80) == 0:
+                if shift < size and (b & 0x40):
+                    result |= - (1 << shift)
+                break
+        return result, i, i - start
 
     i = HEADER_SIZE
     from collections import Counter
@@ -1005,6 +1143,13 @@ def count_op_bytes(patch_bytes):
         elif op == OP_FILL:
             for _ in range(2):
                 _, i, _ = read_uleb128(raw, i)
+        elif op == OP_COPY_RELOC:
+            for _ in range(3):
+                _, i, _ = read_uleb128(raw, i)
+            nslots, i, _ = read_uleb128(raw, i)
+            for _ in range(nslots):
+                _, i, _ = read_uleb128(raw, i)
+                i += 4
         elif op == OP_END:
             break
         else:
@@ -1017,7 +1162,7 @@ def count_op_bytes(patch_bytes):
 
 def count_op_bytes_meta_data(patch_bytes):
     import zlib
-    from generator.core.protocol import OP_COPY, OP_ADD, OP_PATCH_FROM_OLD, OP_FILL, OP_PATCH_COMPACT, OP_END, HEADER_SIZE
+    from generator.core.protocol import OP_COPY, OP_ADD, OP_PATCH_FROM_OLD, OP_FILL, OP_PATCH_COMPACT, OP_COPY_RELOC, OP_END, HEADER_SIZE
     try:
         raw = zlib.decompress(patch_bytes)
     except Exception:
@@ -1028,6 +1173,7 @@ def count_op_bytes_meta_data(patch_bytes):
         OP_PATCH_FROM_OLD: "PATCH",
         OP_FILL: "FILL",
         OP_PATCH_COMPACT: "PATCH_COMPACT",
+        OP_COPY_RELOC: "COPY_RELOC",
         OP_END: "END"
     }
     def read_uleb128(raw, i):
@@ -1042,6 +1188,21 @@ def count_op_bytes_meta_data(patch_bytes):
             if not (b & 0x80):
                 break
         return val, i, i - start
+    def read_sleb128(raw, i):
+        result = 0
+        shift = 0
+        start = i
+        size = 64
+        while True:
+            b = raw[i]
+            i += 1
+            result |= ((b & 0x7F) << shift)
+            shift += 7
+            if (b & 0x80) == 0:
+                if shift < size and (b & 0x40):
+                    result |= - (1 << shift)
+                break
+        return result, i, i - start
 
     i = HEADER_SIZE
     from collections import Counter, defaultdict
@@ -1114,6 +1275,25 @@ def count_op_bytes_meta_data(patch_bytes):
                 _, i2, l = read_uleb128(raw, i)
                 meta += l
                 i = i2
+        elif op == OP_COPY_RELOC:
+            _, i2, l = read_uleb128(raw, i)
+            meta += l
+            i = i2
+            _, i2, l = read_uleb128(raw, i)
+            meta += l
+            i = i2
+            nslots, i2, l = read_uleb128(raw, i)
+            meta += l
+            i = i2
+            last = 0
+            for _ in range(nslots):
+                delta, i2, l1 = read_uleb128(raw, i)
+                meta += l1
+                i = i2
+                _, i2, l2 = read_sleb128(raw, i)
+                meta += l2
+                i = i2
+                last += delta
         elif op == OP_END:
             pass
         else:
@@ -1143,6 +1323,7 @@ def generate_patch_global_only(
     with open(new_path, 'rb') as f:
         new_bin = f.read()
     new_len = len(new_bin)
+    flash_hi = flash_base + max(len(old_bin), len(new_bin))
 
     # （可选）基于反汇编得到的掩码点构建归一化视图，掩码点来自符号 JSON（如果提供），
     # 用于驱动匹配，而补丁发射阶段仍然使用真实字节。
@@ -1221,8 +1402,20 @@ def generate_patch_global_only(
         except Exception:
             changes = None
 
-        if changes is None:
-            changes = _try_reloc_patch_if_norm_equal(
+        reloc_desc: Optional[List[Tuple[int, int]]] = None
+        if changes:
+            reloc_desc = _changes_to_reloc_descriptors(
+                changes,
+                old_bin,
+                new_bin,
+                o_off,
+                n_off,
+                endian,
+            )
+            if reloc_desc is not None:
+                changes = None
+        if reloc_desc is None:
+            reloc_desc = _try_detect_reloc_descriptors(
                 old_bin,
                 new_bin,
                 old_match_bytes,
@@ -1233,13 +1426,34 @@ def generate_patch_global_only(
                 flash_base,
                 flash_hi,
                 endian,
+                require_norm=True,
             )
-        emit_best_for_region(
-            pb,
-            o_off,
-            new_bin[n_off:n_off + size],
-            changes,
-        )
+        if reloc_desc is None:
+            reloc_desc = _try_detect_reloc_descriptors(
+                old_bin,
+                new_bin,
+                None,
+                None,
+                o_off,
+                n_off,
+                size,
+                flash_base,
+                flash_hi,
+                endian,
+                require_norm=False,
+            )
+        if reloc_desc is not None:
+            if reloc_desc:
+                pb.op_copy_reloc(o_off, size, reloc_desc)
+            else:
+                pb.op_copy(o_off, size)
+        else:
+            emit_best_for_region(
+                pb,
+                o_off,
+                new_bin[n_off:n_off + size],
+                changes,
+            )
         cur = n_off + size
 
     if cur < new_len:
@@ -1317,9 +1531,9 @@ def main():
     print(f"[OK] 补丁已生成: {args.out}, 长度 {len(patch_bytes)} bytes")
     total_ops = sum(stats.values())
     print(f"[STATS] 指令总数={total_ops} | COPY={stats.get('COPY',0)} "
-          f"PATCH={stats.get('PATCH',0)} ADD={stats.get('ADD',0)} FILL={stats.get('FILL',0)} "
+          f"COPY_RELOC={stats.get('COPY_RELOC',0)} PATCH={stats.get('PATCH',0)} "
+          f"ADD={stats.get('ADD',0)} FILL={stats.get('FILL',0)} "
           f"PATCH_COMPACT={stats.get('PATCH_COMPACT',0)}")
-
     op_bytes = count_op_bytes(patch_bytes)
     total_bytes = sum(op_bytes.values())
     print("[COST] 指令类型字节开销:")
@@ -1328,7 +1542,7 @@ def main():
 
     def count_op_stats(patch_bytes):
         import zlib
-        from generator.core.protocol import OP_COPY, OP_ADD, OP_PATCH_FROM_OLD, OP_FILL, OP_PATCH_COMPACT, OP_END, HEADER_SIZE
+        from generator.core.protocol import OP_COPY, OP_ADD, OP_PATCH_FROM_OLD, OP_FILL, OP_PATCH_COMPACT, OP_COPY_RELOC, OP_END, HEADER_SIZE
         try:
             raw = zlib.decompress(patch_bytes)
         except Exception:
@@ -1339,6 +1553,7 @@ def main():
             OP_PATCH_FROM_OLD: "PATCH",
             OP_FILL: "FILL",
             OP_PATCH_COMPACT: "PATCH_COMPACT",
+            OP_COPY_RELOC: "COPY_RELOC",
         }
         def read_uleb128(raw, i):
             val = 0
@@ -1351,6 +1566,20 @@ def main():
                 if not (b & 0x80):
                     break
             return val, i
+        def read_sleb128(raw, i):
+            result = 0
+            shift = 0
+            size = 64
+            while True:
+                b = raw[i]
+                i += 1
+                result |= ((b & 0x7F) << shift)
+                shift += 7
+                if (b & 0x80) == 0:
+                    if shift < size and (b & 0x40):
+                        result |= - (1 << shift)
+                    break
+            return result, i
 
         i = HEADER_SIZE
         from collections import defaultdict
@@ -1394,6 +1623,14 @@ def main():
                 for _ in range(2):
                     _, i = read_uleb128(raw, i)
                 op_lens["FILL"].append(i - start)
+            elif op == OP_COPY_RELOC:
+                for _ in range(3):
+                    _, i = read_uleb128(raw, i)
+                nslots, i = read_uleb128(raw, i)
+                for _ in range(nslots):
+                    _, i = read_uleb128(raw, i)
+                    i += 4
+                op_lens["COPY_RELOC"].append(i - start)
             elif op == OP_END:
                 break
             else:
@@ -1411,6 +1648,9 @@ def main():
         copy_lens = op_lens["COPY"]
         print(f"[DIAG] COPY 片段数={len(copy_lens)} 总字节={sum(copy_lens)} 平均长度={sum(copy_lens)/len(copy_lens):.2f}")
         print(f"[DIAG] COPY Top10 长度={sorted(copy_lens, reverse=True)[:10]}")
+    if op_lens["COPY_RELOC"]:
+        cr_lens = op_lens["COPY_RELOC"]
+        print(f"[DIAG] COPY_RELOC 片段数={len(cr_lens)} 总字节={sum(cr_lens)} 平均长度={sum(cr_lens)/len(cr_lens):.2f}")
     if op_lens["PATCH_COMPACT"]:
         pc_lens = op_lens["PATCH_COMPACT"]
         print(f"[DIAG] PATCH_COMPACT 区域数={len(pc_lens)} 平均长度={sum(pc_lens)/len(pc_lens):.2f}")

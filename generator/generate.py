@@ -30,6 +30,7 @@ from generator.strategies.heuristics import (
     try_local_sparse_patch,
 )
 from generator.tools.framing import split_frames
+from generator.tools import patch_stats
 from generator.analysis.simlite import (
     reloc_aware_similarity_lite,
     guess_arch_mode,
@@ -885,185 +886,81 @@ def _verify_with_apply(old_path: str, new_path: str, patch_path: str, payload: i
     print(out.strip())
     return cp.returncode == 0 and "[OK] 重建结果与期望固件一致" in out
 
-def count_op_bytes(patch_bytes):
-    import zlib
-    from generator.core.protocol import OP_COPY, OP_ADD, OP_PATCH_FROM_OLD, OP_FILL, OP_PATCH_COMPACT, OP_END, HEADER_SIZE
+
+def _print_patch_diagnostics(
+    patch_bytes: bytes,
+    stats: Dict[str, int],
+    *,
+    old_path: str,
+    new_path: str,
+    old_sym: Optional[str],
+    new_sym: Optional[str],
+    old_map: Optional[str],
+    new_map: Optional[str],
+    flash_base: int,
+) -> None:
+    """Print opcode/memory statistics for the generated patch."""
+    total_ops = sum(stats.values())
+    print(f"[STATS] 指令总数={total_ops} | COPY={stats.get('COPY',0)} "
+          f"PATCH={stats.get('PATCH',0)} ADD={stats.get('ADD',0)} FILL={stats.get('FILL',0)} "
+          f"PATCH_COMPACT={stats.get('PATCH_COMPACT',0)}")
+
+    op_bytes = patch_stats.count_opcode_bytes(patch_bytes)
+    total_bytes = sum(op_bytes.values()) or 1
+    print("[COST] 指令类型字节开销:")
+    for k, v in op_bytes.items():
+        print(f"  {k}: bytes={v} pct={v/total_bytes*100:.2f}%")
+
+    op_lens = patch_stats.collect_op_stats(patch_bytes)
+    if op_lens["ADD"]:
+        add_lens = op_lens["ADD"]
+        avg_add = sum(add_lens) / len(add_lens)
+        print(f"[DIAG] ADD 片段数={len(add_lens)} 总字节={sum(add_lens)} 平均长度={avg_add:.2f}")
+        print(f"[DIAG] ADD Top10 长度={sorted(add_lens, reverse=True)[:10]}")
+        if avg_add < 4:
+            print("[DIAG] 注意: 平均 ADD 长度 <4, 分块过碎, 可尝试聚簇合并或提高 CDC 最小块大小.")
+    if op_lens["COPY"]:
+        copy_lens = op_lens["COPY"]
+        print(f"[DIAG] COPY 片段数={len(copy_lens)} 总字节={sum(copy_lens)} 平均长度={sum(copy_lens)/len(copy_lens):.2f}")
+        print(f"[DIAG] COPY Top10 长度={sorted(copy_lens, reverse=True)[:10]}")
+    if op_lens["PATCH_COMPACT"]:
+        pc_lens = op_lens["PATCH_COMPACT"]
+        print(f"[DIAG] PATCH_COMPACT 区域数={len(pc_lens)} 平均长度={sum(pc_lens)/len(pc_lens):.2f}")
+    if op_lens["PATCH"]:
+        p_lens = op_lens["PATCH"]
+        print(f"[DIAG] PATCH 区域数={len(p_lens)} 平均长度={sum(p_lens)/len(p_lens):.2f}")
+
+    meta_bytes, data_bytes = patch_stats.count_meta_data_bytes(patch_bytes)
+    total_meta = sum(meta_bytes.values())
+    total_data = sum(data_bytes.values())
+    denom = total_meta + total_data or 1
+    print("[META] 指令元数据字节开销:")
     try:
-        raw = zlib.decompress(patch_bytes)
-    except Exception:
-        raw = patch_bytes
-    op_map = {
-        OP_COPY: "COPY",
-        OP_ADD: "ADD",
-        OP_PATCH_FROM_OLD: "PATCH",
-        OP_FILL: "FILL",
-        OP_PATCH_COMPACT: "PATCH_COMPACT",
-    }
-    def read_uleb128(raw, i):
-        val = 0
-        shift = 0
-        start = i
-        while True:
-            b = raw[i]
-            val |= (b & 0x7F) << shift
-            shift += 7
-            i += 1
-            if not (b & 0x80):
-                break
-        return val, i, i - start
-
-    i = HEADER_SIZE
-    from collections import Counter
-    op_bytes = Counter()
-    while i < len(raw):
-        op = raw[i]
-        start = i
-        i += 1
-        if op == OP_COPY:
-            for _ in range(2):
-                _, i, _ = read_uleb128(raw, i)
-        elif op == OP_ADD:
-            l, i2, llen = read_uleb128(raw, i)
-            i = i2 + l
-        elif op == OP_PATCH_FROM_OLD:
-            _, i, _ = read_uleb128(raw, i)
-            plen, i, _ = read_uleb128(raw, i)
-            nchanges, i, _ = read_uleb128(raw, i)
-            last = 0
-            for _ in range(nchanges):
-                delta, i, _ = read_uleb128(raw, i)
-                clen, i, _ = read_uleb128(raw, i)
-                i += clen
-                last += delta
-        elif op == OP_PATCH_COMPACT:
-            _, i, _ = read_uleb128(raw, i)
-            plen, i, _ = read_uleb128(raw, i)
-            nchanges, i, _ = read_uleb128(raw, i)
-            if nchanges == 0:
-                pass
-            else:
-                change_len, i, _ = read_uleb128(raw, i)
-                for _ in range(nchanges):
-                    _, i, _ = read_uleb128(raw, i)
-                i += nchanges * change_len
-        elif op == OP_FILL:
-            for _ in range(2):
-                _, i, _ = read_uleb128(raw, i)
-        elif op == OP_END:
-            break
-        else:
-            break
-        op_bytes[op_map.get(op, "OTHER")] += (i - start)
-    other_bytes = len(raw) - sum(op_bytes.values())
-    if other_bytes > 0:
-        op_bytes["OTHER"] += other_bytes
-    return op_bytes
-
-def count_op_bytes_meta_data(patch_bytes):
-    import zlib
-    from generator.core.protocol import OP_COPY, OP_ADD, OP_PATCH_FROM_OLD, OP_FILL, OP_PATCH_COMPACT, OP_END, HEADER_SIZE
-    try:
-        raw = zlib.decompress(patch_bytes)
-    except Exception:
-        raw = patch_bytes
-    op_map = {
-        OP_COPY: "COPY",
-        OP_ADD: "ADD",
-        OP_PATCH_FROM_OLD: "PATCH",
-        OP_FILL: "FILL",
-        OP_PATCH_COMPACT: "PATCH_COMPACT",
-        OP_END: "END"
-    }
-    def read_uleb128(raw, i):
-        val = 0
-        shift = 0
-        start = i
-        while True:
-            b = raw[i]
-            val |= (b & 0x7F) << shift
-            shift += 7
-            i += 1
-            if not (b & 0x80):
-                break
-        return val, i, i - start
-
-    i = HEADER_SIZE
-    from collections import Counter, defaultdict
-    meta_bytes = Counter()
-    data_bytes = Counter()
-    while i < len(raw):
-        op = raw[i]
-        op_name = op_map.get(op, "OTHER")
-        start = i
-        i += 1
-        meta = 1  # 指令头部
-        if op == OP_COPY:
-            _, i2, l = read_uleb128(raw, i)
-            meta += l
-            i = i2
-            _, i2, l = read_uleb128(raw, i)
-            meta += l
-            i = i2
-        elif op == OP_ADD:
-            l, i2, llen = read_uleb128(raw, i)
-            meta += llen
-            i = i2
-            data_bytes[op_name] += l
-            i += l
-        elif op == OP_PATCH_FROM_OLD:
-            _, i2, l = read_uleb128(raw, i)
-            meta += l
-            i = i2
-            _, i2, l = read_uleb128(raw, i)
-            meta += l
-            i = i2
-            nchanges, i2, l = read_uleb128(raw, i)
-            meta += l
-            i = i2
-            last = 0
-            for _ in range(nchanges):
-                delta, i2, l1 = read_uleb128(raw, i)
-                meta += l1
-                i = i2
-                clen, i2, l2 = read_uleb128(raw, i)
-                meta += l2
-                i = i2
-                data_bytes[op_name] += clen
-                i += clen
-                last += delta
-        elif op == OP_PATCH_COMPACT:
-            _, i2, l = read_uleb128(raw, i)
-            meta += l
-            i = i2
-            _, i2, l = read_uleb128(raw, i)
-            meta += l
-            i = i2
-            nchanges, i2, l = read_uleb128(raw, i)
-            meta += l
-            i = i2
-            if nchanges > 0:
-                change_len, i2, llen = read_uleb128(raw, i)
-                meta += llen
-                i = i2
-                last = 0
-                for _ in range(nchanges):
-                    delta, i2, l = read_uleb128(raw, i)
-                    meta += l
-                    i = i2
-                    last += delta
-                data_bytes[op_name] += nchanges * change_len
-                i += nchanges * change_len
-        elif op == OP_FILL:
-            for _ in range(2):
-                _, i2, l = read_uleb128(raw, i)
-                meta += l
-                i = i2
-        elif op == OP_END:
-            pass
-        else:
-            break
-        meta_bytes[op_name] += meta
-    return meta_bytes, data_bytes
+        with open(old_path, 'rb') as f:
+            old_bin = f.read()
+        with open(new_path, 'rb') as f:
+            new_bin = f.read()
+        old_len = len(old_bin)
+        new_len = len(new_bin)
+        old_syms_raw, _ = load_symbols_any(old_sym, old_map, flash_base, old_len)
+        new_syms_raw, _ = load_symbols_any(new_sym, new_map, flash_base, new_len)
+        semantic_bytes = 0
+        if old_syms_raw and new_syms_raw:
+            pairs = pair_symbols(old_syms_raw, new_syms_raw, old_len, new_len)
+            for n_off, _, size in pairs:
+                size = min(size, new_len - n_off)
+                if size > 0:
+                    semantic_bytes += size
+        hole_bytes = new_len - semantic_bytes
+        print(f"[COVERAGE] 语义区覆盖={semantic_bytes} bytes ({semantic_bytes/new_len*100:.2f}%) | "
+              f"空洞区={hole_bytes} bytes ({hole_bytes/new_len*100:.2f}%)")
+    except Exception as e:
+        print(f"[COVERAGE] 语义区覆盖统计失败: {e}")
+    for k in meta_bytes:
+        data = data_bytes.get(k, 0)
+        print(f"  {k}: meta_bytes={meta_bytes[k]} data_bytes={data} "
+              f"meta_pct={meta_bytes[k]/denom*100:.2f}% data_pct={data/denom*100:.2f}%")
+    print(f"  总元数据: {total_meta} bytes, 总数据: {total_data} bytes, 总补丁: {total_meta+total_data} bytes")
 
 
 def generate_patch_global_only(
@@ -1245,138 +1142,17 @@ def main():
     with open(args.out, 'wb') as f:
         f.write(patch_bytes)
     print(f"[OK] 补丁已生成: {args.out}, 长度 {len(patch_bytes)} bytes")
-    total_ops = sum(stats.values())
-    print(f"[STATS] 指令总数={total_ops} | COPY={stats.get('COPY',0)} "
-          f"PATCH={stats.get('PATCH',0)} ADD={stats.get('ADD',0)} FILL={stats.get('FILL',0)} "
-          f"PATCH_COMPACT={stats.get('PATCH_COMPACT',0)}")
-
-    op_bytes = count_op_bytes(patch_bytes)
-    total_bytes = sum(op_bytes.values())
-    print("[COST] 指令类型字节开销:")
-    for k, v in op_bytes.items():
-        print(f"  {k}: bytes={v} pct={v/total_bytes*100:.2f}%")
-
-    def count_op_stats(patch_bytes):
-        import zlib
-        from generator.core.protocol import OP_COPY, OP_ADD, OP_PATCH_FROM_OLD, OP_FILL, OP_PATCH_COMPACT, OP_END, HEADER_SIZE
-        try:
-            raw = zlib.decompress(patch_bytes)
-        except Exception:
-            raw = patch_bytes
-        op_map = {
-            OP_COPY: "COPY",
-            OP_ADD: "ADD",
-            OP_PATCH_FROM_OLD: "PATCH",
-            OP_FILL: "FILL",
-            OP_PATCH_COMPACT: "PATCH_COMPACT",
-        }
-        def read_uleb128(raw, i):
-            val = 0
-            shift = 0
-            while True:
-                b = raw[i]
-                val |= (b & 0x7F) << shift
-                shift += 7
-                i += 1
-                if not (b & 0x80):
-                    break
-            return val, i
-
-        i = HEADER_SIZE
-        from collections import defaultdict
-        op_lens = defaultdict(list)
-        while i < len(raw):
-            op = raw[i]
-            start = i
-            i += 1
-            if op == OP_COPY:
-                for _ in range(2):
-                    _, i = read_uleb128(raw, i)
-                op_lens["COPY"].append(i - start)
-            elif op == OP_ADD:
-                l, i2 = read_uleb128(raw, i)
-                i = i2 + l
-                op_lens["ADD"].append(l)
-            elif op == OP_PATCH_FROM_OLD:
-                _, i = read_uleb128(raw, i)
-                plen, i = read_uleb128(raw, i)
-                nchanges, i = read_uleb128(raw, i)
-                last = 0
-                for _ in range(nchanges):
-                    delta, i = read_uleb128(raw, i)
-                    clen, i = read_uleb128(raw, i)
-                    i += clen
-                    last += delta
-                op_lens["PATCH"].append(i - start)
-            elif op == OP_PATCH_COMPACT:
-                _, i = read_uleb128(raw, i)
-                plen, i = read_uleb128(raw, i)
-                nchanges, i = read_uleb128(raw, i)
-                if nchanges == 0:
-                    pass
-                else:
-                    change_len, i = read_uleb128(raw, i)
-                    for _ in range(nchanges):
-                        _, i = read_uleb128(raw, i)
-                    i += nchanges * change_len
-                op_lens["PATCH_COMPACT"].append(i - start)
-            elif op == OP_FILL:
-                for _ in range(2):
-                    _, i = read_uleb128(raw, i)
-                op_lens["FILL"].append(i - start)
-            elif op == OP_END:
-                break
-            else:
-                break
-        return op_lens
-
-    op_lens = count_op_stats(patch_bytes)
-    if op_lens["ADD"]:
-        add_lens = op_lens["ADD"]
-        print(f"[DIAG] ADD 片段数={len(add_lens)} 总字节={sum(add_lens)} 平均长度={sum(add_lens)/len(add_lens):.2f}")
-        print(f"[DIAG] ADD Top10 长度={sorted(add_lens, reverse=True)[:10]}")
-        if sum(add_lens)/len(add_lens) < 4:
-            print("[DIAG] 注意: 平均 ADD 长度 <4, 分块过碎, 可尝试聚簇合并或提高 CDC 最小块大小.")
-    if op_lens["COPY"]:
-        copy_lens = op_lens["COPY"]
-        print(f"[DIAG] COPY 片段数={len(copy_lens)} 总字节={sum(copy_lens)} 平均长度={sum(copy_lens)/len(copy_lens):.2f}")
-        print(f"[DIAG] COPY Top10 长度={sorted(copy_lens, reverse=True)[:10]}")
-    if op_lens["PATCH_COMPACT"]:
-        pc_lens = op_lens["PATCH_COMPACT"]
-        print(f"[DIAG] PATCH_COMPACT 区域数={len(pc_lens)} 平均长度={sum(pc_lens)/len(pc_lens):.2f}")
-    if op_lens["PATCH"]:
-        p_lens = op_lens["PATCH"]
-        print(f"[DIAG] PATCH 区域数={len(p_lens)} 平均长度={sum(p_lens)/len(p_lens):.2f}")
-
-    meta_bytes, data_bytes = count_op_bytes_meta_data(patch_bytes)
-    total_meta = sum(meta_bytes.values())
-    total_data = sum(data_bytes.values())
-    print("[META] 指令元数据字节开销:")
-    try:
-        from generator.parsers.symbols import load_symbols_any, pair_symbols
-        with open(args.old, 'rb') as f:
-            old_bin = f.read()
-        with open(args.new, 'rb') as f:
-            new_bin = f.read()
-        old_len = len(old_bin)
-        new_len = len(new_bin)
-        old_syms_raw, _ = load_symbols_any(args.old_sym, args.old_map, int(args.flash_base, 0), old_len)
-        new_syms_raw, _ = load_symbols_any(args.new_sym, args.new_map, int(args.flash_base, 0), new_len)
-        semantic_bytes = 0
-        if old_syms_raw and new_syms_raw:
-            pairs = pair_symbols(old_syms_raw, new_syms_raw, old_len, new_len)
-            for n_off, o_off, size in pairs:
-                size = min(size, new_len - n_off)
-                if size > 0:
-                    semantic_bytes += size
-        hole_bytes = new_len - semantic_bytes
-        print(f"[COVERAGE] 语义区覆盖={semantic_bytes} bytes ({semantic_bytes/new_len*100:.2f}%) | 空洞区={hole_bytes} bytes ({hole_bytes/new_len*100:.2f}%)")
-    except Exception as e:
-        print(f"[COVERAGE] 语义区覆盖统计失败: {e}")
-    for k in meta_bytes:
-        print(f"  {k}: meta_bytes={meta_bytes[k]} data_bytes={data_bytes.get(k,0)} "
-              f"meta_pct={meta_bytes[k]/(total_meta+total_data)*100:.2f}% data_pct={data_bytes.get(k,0)/(total_meta+total_data)*100:.2f}%")
-    print(f"  总元数据: {total_meta} bytes, 总数据: {total_data} bytes, 总补丁: {total_meta+total_data} bytes")
+    _print_patch_diagnostics(
+        patch_bytes,
+        stats,
+        old_path=args.old,
+        new_path=args.new,
+        old_sym=args.old_sym,
+        new_sym=args.new_sym,
+        old_map=args.old_map,
+        new_map=args.new_map,
+        flash_base=flash_base,
+    )
 
     if args.frames:
         os.makedirs(args.frames, exist_ok=True)

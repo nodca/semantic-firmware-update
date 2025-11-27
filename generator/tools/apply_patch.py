@@ -62,19 +62,25 @@ class Stream:
         return result
 
 def apply_patch_in_memory(old_bytes: bytes, patch_data: bytes):
-    """内存中应用补丁"""
+    """Apply patch and collect stats suitable for MCU estimation."""
     s = Stream(patch_data)
-    
-    # 1) 解析补丁头部
+
     hdr = s.read_exact(HEADER_SIZE)
     magic, flags, target_size, _reserved = struct.unpack(HEADER_FMT, hdr)
     if magic != MAGIC:
         raise ValueError("bad patch magic")
+
     out = bytearray(target_size)
     pos = 0
     old_len = len(old_bytes)
+    stats = {
+        "copy_bytes": 0,
+        "add_bytes": 0,
+        "patch_bytes": 0,
+        "max_literal": 0,
+        "max_block": 0,
+    }
 
-    # 2) 指令循环
     while True:
         op = s.read_u8()
         if op == OP_END:
@@ -82,35 +88,40 @@ def apply_patch_in_memory(old_bytes: bytes, patch_data: bytes):
 
         elif op == OP_COPY:
             old_off = s.read_uleb128()
-            length  = s.read_uleb128()
+            length = s.read_uleb128()
             if old_off + length > old_len or pos + length > target_size:
                 raise ValueError("COPY out of range")
-            out[pos:pos+length] = old_bytes[old_off:old_off+length]
+            out[pos:pos + length] = old_bytes[old_off:old_off + length]
             pos += length
+            stats["copy_bytes"] += length
+            stats["max_block"] = max(stats["max_block"], length)
 
         elif op == OP_ADD:
             lit_len = s.read_uleb128()
             if pos + lit_len > target_size:
                 raise ValueError("ADD out of range")
             lit = s.read_exact(lit_len)
-            out[pos:pos+lit_len] = lit
+            out[pos:pos + lit_len] = lit
             pos += lit_len
+            stats["add_bytes"] += lit_len
+            stats["max_literal"] = max(stats["max_literal"], lit_len)
 
         elif op == OP_FILL:
             byte_val = s.read_uleb128() & 0xFF
-            length   = s.read_uleb128()
+            length = s.read_uleb128()
             if pos + length > target_size:
                 raise ValueError("FILL out of range")
-            out[pos:pos+length] = bytes([byte_val]) * length
+            out[pos:pos + length] = bytes([byte_val]) * length
             pos += length
+            stats["add_bytes"] += length
 
         elif op == OP_PATCH_FROM_OLD:
             old_off = s.read_uleb128()
-            length  = s.read_uleb128()
+            length = s.read_uleb128()
             nchanges = s.read_uleb128()
             if old_off + length > old_len or pos + length > target_size:
                 raise ValueError("PATCH_FROM_OLD out of range")
-            block = bytearray(old_bytes[old_off:old_off+length])
+            block = bytearray(old_bytes[old_off:old_off + length])
             last_off = 0
             for _ in range(nchanges):
                 delta = s.read_uleb128()
@@ -119,10 +130,12 @@ def apply_patch_in_memory(old_bytes: bytes, patch_data: bytes):
                 if off_in_block + clen > length:
                     raise ValueError("PATCH chunk out of range")
                 data = s.read_exact(clen)
-                block[off_in_block:off_in_block+clen] = data
+                block[off_in_block:off_in_block + clen] = data
                 last_off = off_in_block
-            out[pos:pos+length] = block
+            out[pos:pos + length] = block
             pos += length
+            stats["patch_bytes"] += length
+            stats["max_block"] = max(stats["max_block"], length)
 
         elif op == OP_PATCH_COMPACT:
             old_off = s.read_uleb128()
@@ -131,27 +144,27 @@ def apply_patch_in_memory(old_bytes: bytes, patch_data: bytes):
             if old_off + length > old_len or pos + length > target_size:
                 raise ValueError("PATCH_COMPACT out of range")
 
-            block = bytearray(old_bytes[old_off:old_off+length])
+            block = bytearray(old_bytes[old_off:old_off + length])
             if nchanges > 0:
                 change_len = s.read_uleb128()
                 deltas = [s.read_uleb128() for _ in range(nchanges)]
                 all_data = s.read_exact(nchanges * change_len)
-                
+
                 last_off = 0
                 data_ptr = 0
                 for delta in deltas:
                     off_in_block = last_off + delta
                     if off_in_block + change_len > length:
                         raise ValueError("PATCH_COMPACT chunk out of range")
-                    
-                    chunk = all_data[data_ptr : data_ptr + change_len]
-                    block[off_in_block:off_in_block+change_len] = chunk
-                    
+                    chunk = all_data[data_ptr:data_ptr + change_len]
+                    block[off_in_block:off_in_block + change_len] = chunk
                     data_ptr += change_len
                     last_off = off_in_block
-            
-            out[pos:pos+length] = block
+
+            out[pos:pos + length] = block
             pos += length
+            stats["patch_bytes"] += length
+            stats["max_block"] = max(stats["max_block"], length)
 
         elif op == OP_ADD_LZ4:
             raise NotImplementedError("LZ4 not supported on device")
@@ -161,7 +174,7 @@ def apply_patch_in_memory(old_bytes: bytes, patch_data: bytes):
 
     if pos != target_size:
         raise ValueError(f"incomplete output: wrote {pos} / {target_size} bytes")
-    return bytes(out)
+    return bytes(out), stats
 
 def file_chunker(path: str, payload: int = 502):
     """按 502B 有效载荷分片读取补丁（模拟设备端流式接收）。"""
@@ -196,7 +209,7 @@ def main():
         patch_data = patch_compressed
 
     # 应用补丁
-    new_bytes = apply_patch_in_memory(old_bytes, patch_data)
+    new_bytes, stats = apply_patch_in_memory(old_bytes, patch_data)
 
     # 验证
     if args.expect:
@@ -225,6 +238,21 @@ def main():
         print(f"[OK] 已写出新固件: {args.out} ({len(new_bytes)} bytes)")
     else:
         print("[OK] 重建成功（未写文件）")
+
+    # 资源估算
+    peak_buffer = max(stats["max_block"], stats["max_literal"])
+    # 额外缓冲 (指令解析等) 估算为 4 KB
+    peak_ram_est = peak_buffer + 4096
+    copy_bw = 4_000_000
+    add_bw = 3_000_000
+    patch_bw = 2_000_000
+    est_time = (
+        stats["copy_bytes"] / copy_bw +
+        stats["add_bytes"] / add_bw +
+        stats["patch_bytes"] / patch_bw
+    )
+    print(f"[EST] 峰值 RAM 约 {peak_ram_est/1024:.1f} KB")
+    print(f"[EST] 应用时间约 {est_time:.2f} s (假设 {copy_bw/1e6:.1f}/{add_bw/1e6:.1f}/{patch_bw/1e6:.1f} MB/s)")
 
 if __name__ == '__main__':
     main()

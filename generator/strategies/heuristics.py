@@ -136,9 +136,14 @@ def _estimate_patch_compact_size(old_off: int, size: int, changes: List[Tuple[in
 def _estimate_add_size(lit_len: int) -> int:
     return 1 + uleb128_len(lit_len) + lit_len
 
-def emit_best_for_region(pb: PatchBuilder, old_off: int, new_slice: bytes,
-                         changes: Optional[List[Tuple[int, bytes]]]) -> None:
+def emit_best_for_region(
+    pb: PatchBuilder,
+    old_off: int,
+    new_slice: bytes,
+    changes: Optional[List[Tuple[int, bytes]]],
+) -> None:
     size = len(new_slice)
+
     if changes is None:
         emit_literals(pb, new_slice)
         return

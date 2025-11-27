@@ -133,15 +133,15 @@ python -m generator.tools.iar_dump2json \
 
 ```bash
 python -m generator.generate gen \
-  --old old.bin \
-  --new new.bin \
-  --old-sym old.json \
-  --new-sym new.json \
-  --flash-base 0x00000000 \
-  --out patch.bin \
-  --mode global \
-  --arch-mode arm \
-  --endian be \
+  --old old.bin 
+  --new new.bin 
+  --old-sym old.json 
+  --new-sym new.json 
+  --flash-base 0x00000000 
+  --out patch.bin 
+  --mode global 
+  --arch-mode arm 
+  --endian be 
   --verify
 ```
 

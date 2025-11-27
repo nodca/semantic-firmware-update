@@ -508,6 +508,47 @@ def diff_symbol_region_reloc(
     return changes
 
 
+def _try_reloc_patch_if_norm_equal(
+    old_bytes: bytes,
+    new_bytes: bytes,
+    old_norm: Optional[bytes],
+    new_norm: Optional[bytes],
+    old_off: int,
+    new_off: int,
+    size: int,
+    flash_lo: int,
+    flash_hi: int,
+    endian: str,
+) -> Optional[List[Tuple[int, bytes]]]:
+    if (
+        size <= 0
+        or old_norm is None
+        or new_norm is None
+        or old_off < 0
+        or new_off < 0
+        or old_off + size > len(old_norm)
+        or new_off + size > len(new_norm)
+    ):
+        return None
+    if old_norm[old_off:old_off + size] != new_norm[new_off:new_off + size]:
+        return None
+    try:
+        return diff_symbol_region_reloc(
+            old_bytes,
+            new_bytes,
+            old_off,
+            new_off,
+            size,
+            flash_lo,
+            flash_hi,
+            endian=endian,
+            max_changes=max(64, size // 4),
+            max_ratio=0.6,
+        )
+    except Exception:
+        return None
+
+
 def _estimate_patch_cost(old_off: int, size: int, changes: List[Tuple[int, bytes]]) -> int:
     """
     估算某个区域使用 PATCH_FROM_OLD 指令编码时的大致大小。
@@ -545,6 +586,7 @@ def generate_patch(old_path: str, new_path: str,
         new_bin = f.read()
     old_len = len(old_bin)
     new_len = len(new_bin)
+    flash_hi = flash_base + max(len(old_bin), len(new_bin))
     target_size = new_len
     flash_lo = flash_base
     flash_hi = flash_base + max(old_len, new_len)
@@ -822,11 +864,25 @@ def generate_patch(old_path: str, new_path: str,
             start_size = pb.current_size()
             before_add = pb.stats['ADD']
             before_copy = pb.stats['COPY']
+            changes = region['changes']
+            if changes is None:
+                changes = _try_reloc_patch_if_norm_equal(
+                    old_bin,
+                    new_bin,
+                    match_old,
+                    match_new,
+                    region['old_offset'],
+                    region['start'],
+                    region['size'],
+                    flash_lo,
+                    flash_hi,
+                    endian,
+                )
             emit_best_for_region(
-                pb, 
-                region['old_offset'], 
-                new_bin[region['start']:region['start'] + region['size']], 
-                region['changes']
+                pb,
+                region['old_offset'],
+                new_bin[region['start']:region['start'] + region['size']],
+                changes,
             )
             semantic_add_count += pb.stats['ADD'] - before_add
             semantic_copy_count += pb.stats['COPY'] - before_copy
@@ -1164,6 +1220,20 @@ def generate_patch_global_only(
             )
         except Exception:
             changes = None
+
+        if changes is None:
+            changes = _try_reloc_patch_if_norm_equal(
+                old_bin,
+                new_bin,
+                old_match_bytes,
+                new_match_bytes,
+                o_off,
+                n_off,
+                size,
+                flash_base,
+                flash_hi,
+                endian,
+            )
         emit_best_for_region(
             pb,
             o_off,

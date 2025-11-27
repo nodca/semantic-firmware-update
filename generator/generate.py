@@ -2,13 +2,10 @@
 # -*- coding: utf-8 -*-
 # generate.py - 语义感知的轻量固件差分补丁生成器（主入口）
 
-import argparse
-import json
-import os
-import sys
-import subprocess
 from typing import Optional, Tuple, List, Dict
 from tqdm import tqdm
+
+from generator.cli.main import run_cli
 
 from generator.strategies.global_match import global_greedy_hybrid
 from generator.strategies.global_dp import global_dp_hybrid
@@ -19,7 +16,7 @@ from generator.core.protocol import (
     estimate_add_bytes,
     estimate_copy_bytes,
 )
-from generator.parsers.symbols import load_symbols_any, pair_symbols, safe_merge_symbol_regions
+from generator.parsers.symbols import pair_symbols, safe_merge_symbol_regions
 from generator.strategies.cdc import cdc_emit_region, build_cdc_index
 from generator.strategies.greedy import build_block_index, greedy_match
 from generator.strategies.heuristics import (
@@ -29,8 +26,7 @@ from generator.strategies.heuristics import (
     try_global_compact_patch,
     try_local_sparse_patch,
 )
-from generator.tools.framing import split_frames
-from generator.tools import patch_stats
+from generator.utils.symbols import load_symbol_context
 from generator.analysis.simlite import (
     reloc_aware_similarity_lite,
     guess_arch_mode,
@@ -40,6 +36,7 @@ from generator.analysis.simlite import (
 from generator.core.utils import uleb128_len
 
 MIN_COPY_SAVING = 2  # require COPY to save at least 2 bytes vs literal
+GAP_OPT_THRESHOLD = 256
 
 
 def _speed_profile_kwargs(profile: str) -> dict:
@@ -232,6 +229,30 @@ def _build_code_mask_from_symbols(
 
     return mask, func_prefix
 
+class _GlobalMatchIndex:
+    """Streaming index over global DP matches keyed by new-image offset."""
+
+    def __init__(self, matches: Optional[List[Tuple[int, int, int]]]):
+        self.matches = matches or []
+        self.cursor = 0
+
+    def slice(self, start: int, end: int) -> List[Tuple[int, int, int]]:
+        matches = self.matches
+        idx = self.cursor
+        # Skip all matches that end before the requested range.
+        while idx < len(matches) and matches[idx][0] + matches[idx][2] <= start:
+            idx += 1
+        self.cursor = idx
+        out: List[Tuple[int, int, int]] = []
+        while idx < len(matches):
+            n_abs, o_off, ln = matches[idx]
+            if n_abs >= end:
+                break
+            out.append((n_abs, o_off, ln))
+            idx += 1
+        return out
+
+
 def process_gap_region(
     old_bin: bytes,
     new_region: bytes,
@@ -243,50 +264,126 @@ def process_gap_region(
     *,
     global_matches: Optional[List[Tuple[int, int, int]]] = None,
     region_start: int = 0,
+    flash_lo: Optional[int] = None,
+    flash_hi: Optional[int] = None,
+    endian: str = "le",
+    reloc_hint: bool = False,
 ) -> Tuple[int, int, int, int, int, int, int]:
     """
-    处理间隙区域，返回统计元组: 
-    (add_data_bytes, add_meta_bytes, add_count, 
-     copy_meta_bytes, copy_count, 
+    处理间隙区域，返回统计元素：
+    (add_data_bytes, add_meta_bytes, add_count,
+     copy_meta_bytes, copy_count,
      total_region_bytes)
-    注意: COPY指令不含数据，只有元数据
     """
-    if not new_region:
+    region_len = len(new_region)
+    if region_len == 0:
         return (0, 0, 0, 0, 0, 0)
-    
+    region_end = region_start + region_len
+
     start_size = pb.current_size()
     add_data = add_meta = add_count = 0
-    copy_meta = copy_count = 0  # COPY没有数据部分
+    copy_meta = copy_count = 0
 
-    # 如果提供了全局匹配结果，则优先使用全局匹配（Path 2: 强全局匹配驱动 gap 区域）
-    if global_matches is not None:
-        matches: List[Tuple[int, int, int]] = []
-        region_end = region_start + len(new_region)
-        # global_matches 已按新固件偏移排序，这里筛选完全落在当前 gap 区域内的匹配
+    if (
+        reloc_hint
+        and flash_lo is not None
+        and flash_hi is not None
+        and 0 <= region_start <= len(old_bin) - region_len
+        and region_len >= 48
+        and _region_has_flash_pointer(new_region, flash_lo, flash_hi, endian=endian)
+    ):
+        reloc_changes = diff_symbol_region_reloc(
+            old_bin,
+            new_region,
+            region_start,
+            0,
+            region_len,
+            flash_lo,
+            flash_hi,
+            endian=endian,
+            max_changes=min(256, region_len // 4),
+            max_ratio=0.35,
+        )
+        if reloc_changes is not None:
+            emit_best_for_region(
+                pb,
+                region_start,
+                new_region,
+                reloc_changes,
+            )
+            total_region_bytes = pb.current_size() - start_size
+            return (0, 0, 0, 0, 0, total_region_bytes)
+
+    if region_len <= GAP_OPT_THRESHOLD:
+        emit_literals(pb, new_region)
+        total_region_bytes = pb.current_size() - start_size
+        return (
+            region_len,
+            1 + uleb128_len(region_len),
+            1,
+            0,
+            0,
+            total_region_bytes,
+        )
+
+    matches: List[Tuple[int, int, int]] = []
+    covered = [False] * region_len
+
+    if global_matches:
         for n_abs, o_off_m, ln in global_matches:
             if n_abs >= region_end:
                 break
-            if n_abs < region_start:
+            if n_abs + ln <= region_start:
                 continue
-            if n_abs + ln > region_end:
-                # 目前为了简单，只接受完全落在 gap 内的匹配；跨界匹配直接丢弃
+            overlap_start = max(n_abs, region_start)
+            overlap_end = min(n_abs + ln, region_end)
+            overlap_len = overlap_end - overlap_start
+            if overlap_len < 8:
                 continue
-            matches.append((n_abs - region_start, o_off_m, ln))
-    else:
-        # 回退到局部 greedy 匹配
-        matches = greedy_match(
+            rel_new = overlap_start - region_start
+            rel_old = o_off_m + (overlap_start - n_abs)
+            matches.append((rel_new, rel_old, overlap_len))
+            for idx in range(rel_new, rel_new + overlap_len):
+                if 0 <= idx < region_len:
+                    covered[idx] = True
+
+    def _fill_with_local_matches(seg_start: int, seg_end: int) -> None:
+        if seg_end - seg_start <= 0:
+            return
+        local = greedy_match(
             old_bin,
-            new_region,
+            new_region[seg_start:seg_end],
             block_idx,
             block=block_size,
             min_run=min_run,
             scan_step=scan_step,
         )
+        for rel_new, o_off_m, ln in local:
+            abs_new = seg_start + rel_new
+            matches.append((abs_new, o_off_m, ln))
+            for idx in range(abs_new, abs_new + ln):
+                if 0 <= idx < region_len:
+                    covered[idx] = True
+
+    if not matches:
+        _fill_with_local_matches(0, region_len)
+    else:
+        cur = 0
+        while cur < region_len:
+            if covered[cur]:
+                cur += 1
+                continue
+            seg_start = cur
+            while cur < region_len and not covered[cur]:
+                cur += 1
+            _fill_with_local_matches(seg_start, cur)
+
+    matches.sort(key=lambda x: x[0])
+
     cur = 0
-    for (n_off_rel, o_off_m, ln) in matches:
+    for n_off_rel, o_off_m, ln in matches:
         if n_off_rel < 0 or o_off_m < 0 or ln <= 0:
             continue
-
         if n_off_rel > cur:
             add_len = n_off_rel - cur
             if add_len > 0:
@@ -309,17 +406,17 @@ def process_gap_region(
             add_count += 1
             emit_literals(pb, literal)
         cur = n_off_rel + ln
-    if cur < len(new_region):
-        add_len = len(new_region) - cur
+
+    if cur < region_len:
+        add_len = region_len - cur
         if add_len > 0:
             add_data += add_len
             add_meta += 1 + uleb128_len(add_len)
             add_count += 1
             emit_literals(pb, new_region[cur:])
-    
+
     total_region_bytes = pb.current_size() - start_size
     return (add_data, add_meta, add_count, copy_meta, copy_count, total_region_bytes)
-
 
 def _refine_matches_to_real_bytes(
     matches: List[Tuple[int, int, int]],
@@ -509,24 +606,111 @@ def diff_symbol_region_reloc(
     return changes
 
 
-def _estimate_patch_cost(old_off: int, size: int, changes: List[Tuple[int, bytes]]) -> int:
-    """
-    估算某个区域使用 PATCH_FROM_OLD 指令编码时的大致大小。
-    """
-    total = 1 + uleb128_len(old_off) + uleb128_len(size) + uleb128_len(len(changes))
-    last = 0
-    for off, data in changes:
-        delta = off - last
-        total += uleb128_len(delta) + uleb128_len(len(data)) + len(data)
-        last = off
-    return total
+def _looks_like_flash_ptr(value: int, flash_lo: int, flash_hi: int) -> bool:
+    return flash_lo <= value < flash_hi
 
 
-def _estimate_add_cost(length: int) -> int:
+def _region_has_flash_pointer(data: bytes, flash_lo: int, flash_hi: int, *, endian: str = "le", sample_limit: int = 256) -> bool:
+    if flash_lo is None or flash_hi is None:
+        return False
+    word = 4
+    if len(data) < word:
+        return False
+    limit = min(len(data), sample_limit)
+    byte_order = "big" if endian == "be" else "little"
+    hits = 0
+    for off in range(0, limit - word + 1, word):
+        val = int.from_bytes(data[off:off + word], byte_order)
+        if _looks_like_flash_ptr(val, flash_lo, flash_hi):
+            hits += 1
+            if hits >= 2:
+                return True
+    return False
+
+
+def _detect_relocation_regions(
+    old_bin: bytes,
+    new_bin: bytes,
+    covered: List[bool],
+    flash_lo: int,
+    flash_hi: int,
+    *,
+    endian: str = "le",
+    min_words: int = 4,
+    max_span: int = 4096,
+) -> List[Tuple[int, int, List[Tuple[int, bytes]]]]:
     """
-    估算一段字面量序列使用 ADD 指令编码时的大致大小。
+    检测仍在 gap 中但呈现重定位指针特征的区域，返回 (start, size, changes)。
+    只有当对应旧固件位置存在、非指针字节完全一致且至少有一个指针值发生变化时才认为有效。
     """
-    return 1 + uleb128_len(length) + length
+    byte_order = "big" if endian == "be" else "little"
+    word = 4
+    limit = min(len(new_bin), len(covered))
+    regions: List[Tuple[int, int, List[Tuple[int, bytes]]]] = []
+    i = 0
+    while i + word <= limit:
+        if covered[i]:
+            i += 1
+            continue
+        new_word = int.from_bytes(new_bin[i:i + word], byte_order)
+        old_word = int.from_bytes(old_bin[i:i + word], byte_order) if i + word <= len(old_bin) else 0
+        if not (_looks_like_flash_ptr(new_word, flash_lo, flash_hi) or _looks_like_flash_ptr(old_word, flash_lo, flash_hi)):
+            i += 1
+            continue
+
+        start = i
+        j = i
+        ptr_offsets: List[int] = []
+        while j + word <= limit and not covered[j] and (j - start) < max_span:
+            nw = int.from_bytes(new_bin[j:j + word], byte_order)
+            if j + word > len(old_bin):
+                break
+            ow = int.from_bytes(old_bin[j:j + word], byte_order)
+            if not (_looks_like_flash_ptr(nw, flash_lo, flash_hi) or _looks_like_flash_ptr(ow, flash_lo, flash_hi)):
+                break
+            ptr_offsets.append(j)
+            j += word
+
+        run_len = j - start
+        if len(ptr_offsets) < min_words or run_len <= 0 or start + run_len > len(old_bin):
+            i = start + 1
+            continue
+
+        consistent = True
+        changes: List[Tuple[int, bytes]] = []
+        mask = [False] * run_len
+        for ptr in ptr_offsets:
+            rel0 = ptr - start
+            for k in range(word):
+                if rel0 + k < run_len:
+                    mask[rel0 + k] = True
+
+        for rel in range(run_len):
+            if mask[rel]:
+                continue
+            if new_bin[start + rel] != old_bin[start + rel]:
+                consistent = False
+                break
+        if not consistent:
+            i = start + 1
+            continue
+
+        for ptr_off in ptr_offsets:
+            rel = ptr_off - start
+            new_slice = new_bin[ptr_off:ptr_off + word]
+            old_slice = old_bin[ptr_off:ptr_off + word]
+            if new_slice != old_slice:
+                changes.append((rel, new_slice))
+
+        if changes:
+            regions.append((start, run_len, changes))
+            for k in range(start, start + run_len):
+                if k < len(covered):
+                    covered[k] = True
+            i = start + run_len
+        else:
+            i = start + 1
+    return regions
 
 
 def generate_patch(old_path: str, new_path: str,
@@ -554,8 +738,8 @@ def generate_patch(old_path: str, new_path: str,
     if fast is not None:
         return fast
 
-    old_syms_raw, _ = load_symbols_any(old_sym_json, old_map, flash_base, old_len)
-    new_syms_raw, _ = load_symbols_any(new_sym_json, new_map, flash_base, new_len)
+    old_syms_raw, _ = load_symbol_context(old_sym_json, old_map, flash_base, old_len)
+    new_syms_raw, _ = load_symbol_context(new_sym_json, new_map, flash_base, new_len)
 
     semantic_regions = []
     covered = [False] * new_len
@@ -702,6 +886,18 @@ def generate_patch(old_path: str, new_path: str,
                             if 0 <= k < new_len:
                                 covered[k] = True
 
+    # 额外识别未覆盖但呈现重定位特征的区域
+    reloc_regions = _detect_relocation_regions(
+        old_bin,
+        new_bin,
+        covered,
+        flash_lo,
+        flash_hi,
+        endian=endian,
+    )
+    for start, size, changes in reloc_regions:
+        semantic_regions.append((start, start, size, changes))
+
     # ====== 识别间隙区 ======
     gap_regions = []
     start = -1
@@ -764,6 +960,7 @@ def generate_patch(old_path: str, new_path: str,
     matches_norm = global_greedy_hybrid(match_old, match_new, min_length=16)
     # 在真实固件字节上细化 / 过滤匹配，确保 COPY 只覆盖完全相同的数据
     global_matches = _refine_matches_to_real_bytes(matches_norm, old_bin, new_bin)
+    global_match_index = _GlobalMatchIndex(global_matches)
 
     pb = PatchBuilder(target_size)
     pb.header()
@@ -796,6 +993,7 @@ def generate_patch(old_path: str, new_path: str,
             region_data = new_bin[region['start']:region['start'] + region['size']]
             start_size = pb.current_size()
             
+            gm_slice = global_match_index.slice(region['start'], region['start'] + region['size'])
             inc = process_gap_region(
                 old_bin,
                 region_data,
@@ -804,9 +1002,12 @@ def generate_patch(old_path: str, new_path: str,
                 block_size=48,
                 min_run=32,
                 scan_step=8,
-                
-                global_matches=None,
+                global_matches=gm_slice,
                 region_start=region['start'],
+                flash_lo=flash_lo,
+                flash_hi=flash_hi,
+                endian=endian,
+                reloc_hint=True,
             )
             
             # 更新统计
@@ -868,101 +1069,6 @@ def generate_patch(old_path: str, new_path: str,
 
     return patch_bytes, pb.stats
 
-def _verify_with_apply(old_path: str, new_path: str, patch_path: str, payload: int = 502) -> bool:
-    """用模块方式调用 apply_patch。"""
-    cmd = [
-        sys.executable, "-m", "generator.tools.apply_patch",
-        "--old", old_path,
-        "--patch", patch_path,
-        "--expect", new_path,
-        "--payload", str(payload),
-    ]
-    try:
-        cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    except Exception as e:
-        print(f"[VERIFY] 运行失败: {e}")
-        return False
-    out = cp.stdout or ""
-    print(out.strip())
-    return cp.returncode == 0 and "[OK] 重建结果与期望固件一致" in out
-
-
-def _print_patch_diagnostics(
-    patch_bytes: bytes,
-    stats: Dict[str, int],
-    *,
-    old_path: str,
-    new_path: str,
-    old_sym: Optional[str],
-    new_sym: Optional[str],
-    old_map: Optional[str],
-    new_map: Optional[str],
-    flash_base: int,
-) -> None:
-    """Print opcode/memory statistics for the generated patch."""
-    total_ops = sum(stats.values())
-    print(f"[STATS] 指令总数={total_ops} | COPY={stats.get('COPY',0)} "
-          f"PATCH={stats.get('PATCH',0)} ADD={stats.get('ADD',0)} FILL={stats.get('FILL',0)} "
-          f"PATCH_COMPACT={stats.get('PATCH_COMPACT',0)}")
-
-    op_bytes = patch_stats.count_opcode_bytes(patch_bytes)
-    total_bytes = sum(op_bytes.values()) or 1
-    print("[COST] 指令类型字节开销:")
-    for k, v in op_bytes.items():
-        print(f"  {k}: bytes={v} pct={v/total_bytes*100:.2f}%")
-
-    op_lens = patch_stats.collect_op_stats(patch_bytes)
-    if op_lens["ADD"]:
-        add_lens = op_lens["ADD"]
-        avg_add = sum(add_lens) / len(add_lens)
-        print(f"[DIAG] ADD 片段数={len(add_lens)} 总字节={sum(add_lens)} 平均长度={avg_add:.2f}")
-        print(f"[DIAG] ADD Top10 长度={sorted(add_lens, reverse=True)[:10]}")
-        if avg_add < 4:
-            print("[DIAG] 注意: 平均 ADD 长度 <4, 分块过碎, 可尝试聚簇合并或提高 CDC 最小块大小.")
-    if op_lens["COPY"]:
-        copy_lens = op_lens["COPY"]
-        print(f"[DIAG] COPY 片段数={len(copy_lens)} 总字节={sum(copy_lens)} 平均长度={sum(copy_lens)/len(copy_lens):.2f}")
-        print(f"[DIAG] COPY Top10 长度={sorted(copy_lens, reverse=True)[:10]}")
-    if op_lens["PATCH_COMPACT"]:
-        pc_lens = op_lens["PATCH_COMPACT"]
-        print(f"[DIAG] PATCH_COMPACT 区域数={len(pc_lens)} 平均长度={sum(pc_lens)/len(pc_lens):.2f}")
-    if op_lens["PATCH"]:
-        p_lens = op_lens["PATCH"]
-        print(f"[DIAG] PATCH 区域数={len(p_lens)} 平均长度={sum(p_lens)/len(p_lens):.2f}")
-
-    meta_bytes, data_bytes = patch_stats.count_meta_data_bytes(patch_bytes)
-    total_meta = sum(meta_bytes.values())
-    total_data = sum(data_bytes.values())
-    denom = total_meta + total_data or 1
-    print("[META] 指令元数据字节开销:")
-    try:
-        with open(old_path, 'rb') as f:
-            old_bin = f.read()
-        with open(new_path, 'rb') as f:
-            new_bin = f.read()
-        old_len = len(old_bin)
-        new_len = len(new_bin)
-        old_syms_raw, _ = load_symbols_any(old_sym, old_map, flash_base, old_len)
-        new_syms_raw, _ = load_symbols_any(new_sym, new_map, flash_base, new_len)
-        semantic_bytes = 0
-        if old_syms_raw and new_syms_raw:
-            pairs = pair_symbols(old_syms_raw, new_syms_raw, old_len, new_len)
-            for n_off, _, size in pairs:
-                size = min(size, new_len - n_off)
-                if size > 0:
-                    semantic_bytes += size
-        hole_bytes = new_len - semantic_bytes
-        print(f"[COVERAGE] 语义区覆盖={semantic_bytes} bytes ({semantic_bytes/new_len*100:.2f}%) | "
-              f"空洞区={hole_bytes} bytes ({hole_bytes/new_len*100:.2f}%)")
-    except Exception as e:
-        print(f"[COVERAGE] 语义区覆盖统计失败: {e}")
-    for k in meta_bytes:
-        data = data_bytes.get(k, 0)
-        print(f"  {k}: meta_bytes={meta_bytes[k]} data_bytes={data} "
-              f"meta_pct={meta_bytes[k]/denom*100:.2f}% data_pct={data/denom*100:.2f}%")
-    print(f"  总元数据: {total_meta} bytes, 总数据: {total_data} bytes, 总补丁: {total_meta+total_data} bytes")
-
-
 def generate_patch_global_only(
     old_path: str,
     new_path: str,
@@ -984,25 +1090,13 @@ def generate_patch_global_only(
     with open(new_path, 'rb') as f:
         new_bin = f.read()
     new_len = len(new_bin)
+    flash_lo = flash_base
+    flash_hi = flash_base + max(len(old_bin), new_len)
 
     # （可选）基于反汇编得到的掩码点构建归一化视图，掩码点来自符号 JSON（如果提供），
     # 用于驱动匹配，而补丁发射阶段仍然使用真实字节。
-    old_raw = None
-    new_raw = None
-    old_parsed = {}
-    new_parsed = {}
-    if old_sym_json and os.path.isfile(old_sym_json):
-        try:
-            old_raw, old_parsed = load_symbols_any(old_sym_json, None, flash_base, len(old_bin))
-        except Exception:
-            old_raw = None
-            old_parsed = {}
-    if new_sym_json and os.path.isfile(new_sym_json):
-        try:
-            new_raw, new_parsed = load_symbols_any(new_sym_json, None, flash_base, len(new_bin))
-        except Exception:
-            new_raw = None
-            new_parsed = {}
+    old_raw, old_parsed = load_symbol_context(old_sym_json, None, flash_base, len(old_bin))
+    new_raw, new_parsed = load_symbol_context(new_sym_json, None, flash_base, len(new_bin))
 
     code_mask, func_start_prefix = _build_code_mask_from_symbols(
         new_raw,
@@ -1037,6 +1131,8 @@ def generate_patch_global_only(
     pb = PatchBuilder(new_len)
     pb.header()
 
+    block_idx = build_block_index(old_bin, block=48, step=8)
+
     cur = 0
     for n_off, o_off, ln in matches:
         if ln <= 0:
@@ -1045,8 +1141,21 @@ def generate_patch_global_only(
             # DP 结果中不应该出现重叠，防御性跳过
             continue
         if n_off > cur:
-            # 先发射 gap 区域的字面量
-            emit_literals(pb, new_bin[cur:n_off])
+            process_gap_region(
+                old_bin,
+                new_bin[cur:n_off],
+                block_idx,
+                pb,
+                block_size=48,
+                min_run=32,
+                scan_step=8,
+                global_matches=None,
+                region_start=cur,
+                flash_lo=flash_lo,
+                flash_hi=flash_hi,
+                endian=endian,
+                reloc_hint=True,
+            )
         size = ln
         # 在全局匹配块上做一次局部 diff，决定是 COPY / PATCH_FROM_OLD / ADD 更合算
         try:
@@ -1070,131 +1179,30 @@ def generate_patch_global_only(
         cur = n_off + size
 
     if cur < new_len:
-        emit_literals(pb, new_bin[cur:])
+        process_gap_region(
+            old_bin,
+            new_bin[cur:],
+            block_idx,
+            pb,
+            block_size=48,
+            min_run=32,
+            scan_step=8,
+            global_matches=None,
+            region_start=cur,
+            flash_lo=flash_lo,
+            flash_hi=flash_hi,
+            endian=endian,
+            reloc_hint=True,
+        )
 
     pb.end()
     patch_bytes = pb.bytes(compress=True)
     return patch_bytes, pb.stats
 
 
-def main():
-    ap = argparse.ArgumentParser(description="语义感知固件差分补丁生成器（含 502B 分片）")
-    sub = ap.add_subparsers(dest='cmd', required=True)
+def main() -> None:
+    run_cli(generate_patch_global_only, generate_patch)
 
-    g = sub.add_parser('gen', help='生成补丁')
-    g.add_argument('--old', required=True, help='旧固件 bin')
-    g.add_argument('--new', required=True, help='新固件 bin')
-    g.add_argument('--old-sym', default=None, help='旧符号 JSON')
-    g.add_argument('--new-sym', default=None, help='新符号 JSON')
-    g.add_argument('--old-map', default=None, help='旧固件 map')
-    g.add_argument('--new-map', default=None, help='新固件 map')
-    g.add_argument('--flash-base', default='0x08000000', help='FLASH 基地址')
-    g.add_argument('--out', required=True, help='输出补丁文件')
-    g.add_argument('--frames', default=None, help='分片输出目录')
-    g.add_argument('--frame-size', type=int, default=502, help='每片有效载荷字节数')
-    g.add_argument('--cdc', action='store_true', help='启用 CDC 匹配策略（仅高级模式）')
-    g.add_argument('--arch-mode', default='auto', choices=['auto','thumb','arm','raw'], help='ARM 架构模式（自动/Thumb/ARM/raw）')
-    g.add_argument('--endian', default='le', choices=['le','be'], help='端序（TMS570 多为 be）')
-    g.add_argument('--mode', default='global', choices=['global', 'advanced'],
-                   help='选择补丁生成模式：global（默认，全局语义匹配）或 advanced（原始语义差分路径）')
-    g.add_argument('--reloc-aware', action='store_true', help='启用重定位/指令模式相似性判别')
-    g.add_argument('--reloc-th', type=float, default=0.6, help='语义区进入阈值（0-1）')
-    g.add_argument('--reloc-filter', action='store_true', help='当相似度低于阈值时丢弃语义区（默认不丢弃，仅调阈值）')
-    g.add_argument('--reloc-debug', action='store_true', help='打印相似度分项以便诊断')
-    g.add_argument("--verify", action="store_true", help="生成后用设备端应用器校验（apply_patch.py）")
-    g.add_argument("--payload", type=int, default=502, help="校验时模拟设备端每片有效载荷字节数，默认 502")
-    g.add_argument('--speed-profile', default='balanced', choices=['balanced', 'fast'],
-                   help='速度/体积权衡：balanced（默认）或 fast（更快生成，可能轻微增大补丁）')
-
-    args = ap.parse_args()
-    try:
-        flash_base = int(args.flash_base, 0)
-    except Exception:
-        print("[ERROR] --flash-base 格式错误", file=sys.stderr)
-        sys.exit(2)
-
-    if args.mode == 'global':
-        print("[MODE] 使用 global 语义匹配路径（首选）")
-        patch_bytes, stats = generate_patch_global_only(
-            args.old,
-            args.new,
-            old_sym_json=args.old_sym,
-            new_sym_json=args.new_sym,
-            flash_base=flash_base,
-            arch_mode=args.arch_mode,
-            endian=args.endian,
-        )
-    else:
-        print("[MODE] 使用 advanced 语义差分路径")
-        patch_bytes, stats = generate_patch(
-            args.old, args.new,
-            old_sym_json=args.old_sym, new_sym_json=args.new_sym,
-            old_map=args.old_map, new_map=args.new_map,
-            flash_base=flash_base,
-            use_cdc=args.cdc,
-            arch_mode=args.arch_mode,
-            reloc_aware=args.reloc_aware,
-            reloc_th=args.reloc_th,
-            reloc_filter=args.reloc_filter,
-            reloc_debug=args.reloc_debug,
-            endian=args.endian
-        )
-    with open(args.out, 'wb') as f:
-        f.write(patch_bytes)
-    print(f"[OK] 补丁已生成: {args.out}, 长度 {len(patch_bytes)} bytes")
-    _print_patch_diagnostics(
-        patch_bytes,
-        stats,
-        old_path=args.old,
-        new_path=args.new,
-        old_sym=args.old_sym,
-        new_sym=args.new_sym,
-        old_map=args.old_map,
-        new_map=args.new_map,
-        flash_base=flash_base,
-    )
-
-    if args.frames:
-        os.makedirs(args.frames, exist_ok=True)
-        frames, manifest = split_frames(patch_bytes, frame_payload_size=args.frame_size)
-        for i, ch in enumerate(frames):
-            with open(os.path.join(args.frames, f'frame_{i:05d}.bin'), 'wb') as f:
-                f.write(ch)
-        with open(os.path.join(args.frames, 'manifest.json'), 'w', encoding='utf-8') as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
-        print(f"[OK] 已输出分片到 {args.frames}, 共 {len(frames)} 片, 每片有效载荷 {args.frame_size}B")
-        print(f"[OK] manifest.json: total_len={manifest['total_len']} total_crc32=0x{manifest['total_crc32']:08X}")
-
-    if args.verify:
-        ok = _verify_with_apply(args.old, args.new, args.out, payload=args.payload)
-        if ok:
-            print("[VERIFY] OK: apply_patch 重建与新固件一致")
-        else:
-            print("[VERIFY] FAIL: apply_patch 重建与新固件不一致")
-            if args.mode == 'global':
-                print("[VERIFY] 已在 global 模式下，无法继续回退。")
-                sys.exit(2)
-            # 自动回退到全局 COPY+ADD 补丁，但这一次带上符号 / 段信息，启用归一化与 code-aware DP。
-            print("[VERIFY] fallback: 尝试使用全局匹配生成的简单补丁 (global-only)")
-            patch_bytes2, stats2 = generate_patch_global_only(
-                args.old,
-                args.new,
-                min_match_len=16,
-                old_sym_json=args.old_sym,
-                new_sym_json=args.new_sym,
-                flash_base=flash_base,
-                arch_mode=args.arch_mode,
-                endian=args.endian,
-            )
-            with open(args.out, 'wb') as f:
-                f.write(patch_bytes2)
-            print(f"[FALLBACK] 已生成 global-only 补丁到 {args.out}, size={len(patch_bytes2)}")
-            ok2 = _verify_with_apply(args.old, args.new, args.out, payload=args.payload)
-            if ok2:
-                print("[VERIFY] OK: fallback global-only 补丁重建与新固件一致")
-            else:
-                print("[VERIFY] FAIL: fallback global-only 补丁仍然不一致")
-                sys.exit(2)
 
 if __name__ == '__main__':
     main()

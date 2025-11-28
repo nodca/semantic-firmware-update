@@ -116,7 +116,8 @@ def find_global_matches(old_bytes: bytes, new_bytes: bytes, min_length: int = 32
         
         if best_match and best_length >= min_length:
             matches.append(best_match)
-            i += best_length  # 跳过匹配区域
+            # 允许一定重叠，提高覆盖率
+            i += max(1, best_length // 2)
         else:
             i += 1
     

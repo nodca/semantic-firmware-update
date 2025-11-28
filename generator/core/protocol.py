@@ -7,9 +7,11 @@ from .utils import uleb128_encode, uleb128_len
 OP_END = 0x00
 OP_COPY = 0x01
 OP_ADD = 0x02
+OP_DIFF = 0x03  # 新增：差分编码指令 (类似 BSDIFF)
 OP_PATCH_FROM_OLD = 0x04
 OP_FILL = 0x06
 OP_PATCH_COMPACT = 0x07
+OP_PATCH_DIFF = 0x08  # PATCH 变种：变更数据使用差分编码
 
 MAGIC = b'DPT1'
 HEADER_FMT = '<4sHII'
@@ -52,10 +54,28 @@ class PatchCompactOp:
         self.new_off = new_off
         self.type = 'PATCH_COMPACT'
 
+
+class DiffOp:
+    """差分编码指令：存储 new[i] - old[i] 的差值序列"""
+    def __init__(self, old_off: int, diff_data: bytes, new_off: int):
+        self.old_off = old_off
+        self.diff_data = diff_data  # 差值数据
+        self.new_off = new_off
+        self.type = 'DIFF'
+
+class PatchDiffOp:
+    """PATCH 变种：变更数据使用差分编码"""
+    def __init__(self, old_off: int, length: int, changes: List[Tuple[int, bytes]], new_off: int):
+        self.old_off = old_off
+        self.length = length
+        self.changes = changes  # changes 中的 bytes 是差分数据
+        self.new_off = new_off
+        self.type = 'PATCH_DIFF'
+
 class PatchBuilder:
     def __init__(self, target_size: int):
         self.target_size = target_size
-        self.stats = {'COPY':0, 'ADD':0, 'PATCH':0, 'FILL':0, 'PATCH_COMPACT':0}
+        self.stats = {'COPY':0, 'ADD':0, 'DIFF':0, 'PATCH':0, 'FILL':0, 'PATCH_COMPACT':0, 'PATCH_DIFF':0}
         self._pending_add = bytearray()
         self.instructions = []  # 存储中间表示的指令
         self._meta_bytes = HEADER_SIZE  # 预先包含头部
@@ -104,6 +124,31 @@ class PatchBuilder:
         self.flush_add()
         self._append_patch_compact(old_off, length, changes)
         self.stats['PATCH_COMPACT'] += 1
+
+    def op_diff(self, old_off: int, diff_data: bytes):
+        """发射一条 DIFF 指令：存储差值数据而非原始字节"""
+        self.flush_add()
+        self._append_diff(old_off, diff_data)
+        self.stats['DIFF'] += 1
+
+    def op_patch_diff(self, old_off: int, length: int, changes: List[Tuple[int, bytes]], old_bin: bytes):
+        """
+        发射一条 PATCH_DIFF 指令：变更数据使用差分编码
+        changes: [(offset, new_bytes), ...] - 原始变更数据
+        old_bin: 旧固件字节，用于计算差分
+        """
+        self.flush_add()
+        # 将 changes 中的数据转换为差分编码
+        diff_changes = []
+        for off, new_bytes in changes:
+            abs_off = old_off + off
+            diff_bytes = bytearray(len(new_bytes))
+            for i in range(len(new_bytes)):
+                old_val = old_bin[abs_off + i] if abs_off + i < len(old_bin) else 0
+                diff_bytes[i] = (new_bytes[i] - old_val) & 0xFF
+            diff_changes.append((off, bytes(diff_bytes)))
+        self._append_patch_diff(old_off, length, diff_changes)
+        self.stats['PATCH_DIFF'] += 1
 
     def end(self):
         self.flush_add()
@@ -187,18 +232,22 @@ class PatchBuilder:
     
     def _recount_stats(self):
         """重新统计指令数量"""
-        self.stats = {'COPY':0, 'ADD':0, 'PATCH':0, 'FILL':0, 'PATCH_COMPACT':0}
+        self.stats = {'COPY':0, 'ADD':0, 'DIFF':0, 'PATCH':0, 'FILL':0, 'PATCH_COMPACT':0, 'PATCH_DIFF':0}
         for instr in self.instructions:
             if isinstance(instr, CopyOp):
                 self.stats['COPY'] += 1
             elif isinstance(instr, AddOp):
                 self.stats['ADD'] += 1
+            elif isinstance(instr, DiffOp):
+                self.stats['DIFF'] += 1
             elif isinstance(instr, FillOp):
                 self.stats['FILL'] += 1
             elif isinstance(instr, PatchOp):
                 self.stats['PATCH'] += 1
             elif isinstance(instr, PatchCompactOp):
                 self.stats['PATCH_COMPACT'] += 1
+            elif isinstance(instr, PatchDiffOp):
+                self.stats['PATCH_DIFF'] += 1
     
     def _encode_instructions(self):
         """将中间表示的指令编码为二进制"""
@@ -239,20 +288,39 @@ class PatchBuilder:
                 buf += uleb128_encode(instr.length)
                 nchanges = len(instr.changes)
                 buf += uleb128_encode(nchanges)
-                
+
                 if nchanges > 0:
                     change_len = len(instr.changes[0][1])
                     buf += uleb128_encode(change_len)
-                    
+
                     last = 0
                     for off, _ in instr.changes:
                         delta = off - last
                         buf += uleb128_encode(delta)
                         last = off
-                    
+
                     for _, chunk in instr.changes:
                         buf += chunk
-        
+            elif isinstance(instr, DiffOp):
+                # DIFF 指令：old_offset + length + diff_data
+                buf.append(OP_DIFF)
+                buf += uleb128_encode(instr.old_off)
+                buf += uleb128_encode(len(instr.diff_data))
+                buf += instr.diff_data
+            elif isinstance(instr, PatchDiffOp):
+                # PATCH_DIFF 指令：与 PATCH_FROM_OLD 格式相同，但数据是差分编码
+                buf.append(OP_PATCH_DIFF)
+                buf += uleb128_encode(instr.old_off)
+                buf += uleb128_encode(instr.length)
+                buf += uleb128_encode(len(instr.changes))
+                last = 0
+                for off, chunk in instr.changes:
+                    delta = off - last
+                    buf += uleb128_encode(delta)
+                    buf += uleb128_encode(len(chunk))
+                    buf += chunk  # 差分数据
+                    last = off
+
         # 添加结束指令
         buf.append(OP_END)
         
@@ -322,6 +390,29 @@ class PatchBuilder:
         self._record_size(meta, data_bytes)
         self._advance_new_cursor(length)
 
+    def _append_diff(self, old_off: int, diff_data: bytes):
+        """添加 DIFF 指令：差分编码"""
+        length = len(diff_data)
+        self.instructions.append(DiffOp(old_off, diff_data, self._new_pos))
+        # 元数据：opcode(1) + old_off(uleb) + length(uleb)
+        meta = 1 + uleb128_len(old_off) + uleb128_len(length)
+        self._record_size(meta, length)
+        self._advance_new_cursor(length)
+
+    def _append_patch_diff(self, old_off: int, length: int, changes: List[Tuple[int, bytes]]):
+        """添加 PATCH_DIFF 指令：变更数据使用差分编码"""
+        self.instructions.append(PatchDiffOp(old_off, length, changes, self._new_pos))
+        meta = 1 + uleb128_len(old_off) + uleb128_len(length) + uleb128_len(len(changes))
+        data_bytes = 0
+        last = 0
+        for off, chunk in changes:
+            delta = off - last
+            meta += uleb128_len(delta) + uleb128_len(len(chunk))
+            data_bytes += len(chunk)
+            last = off
+        self._record_size(meta, data_bytes)
+        self._advance_new_cursor(length)
+
 
 def estimate_copy_bytes(old_off: int, length: int) -> int:
     """
@@ -336,3 +427,26 @@ def estimate_add_bytes(length: int) -> int:
     估算一条 ADD 指令的总补丁大小（元数据 + literal 数据）。
     """
     return 1 + uleb128_len(length) + length
+
+
+def estimate_diff_bytes(old_off: int, length: int) -> int:
+    """
+    估算一条 DIFF 指令的总补丁大小（元数据 + diff 数据）。
+    注意：diff 数据的实际大小与 ADD 相同，但压缩率通常更高。
+    """
+    return 1 + uleb128_len(old_off) + uleb128_len(length) + length
+
+
+def compute_diff_data(old_bytes: bytes, new_bytes: bytes, old_off: int, new_off: int, length: int) -> bytes:
+    """
+    计算差分数据：new[i] - old[i] (mod 256)
+    这是 BSDIFF 使用的核心编码方式。
+    """
+    diff = bytearray(length)
+    for i in range(length):
+        o_idx = old_off + i
+        n_idx = new_off + i
+        old_val = old_bytes[o_idx] if o_idx < len(old_bytes) else 0
+        new_val = new_bytes[n_idx] if n_idx < len(new_bytes) else 0
+        diff[i] = (new_val - old_val) & 0xFF
+    return bytes(diff)

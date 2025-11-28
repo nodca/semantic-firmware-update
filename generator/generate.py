@@ -49,6 +49,7 @@ def _speed_profile_kwargs(profile: str) -> dict:
             "greedy_min_run": 24,
             "greedy_scan_step": 8,
         }
+    # 默认配置：不跳过局部匹配，追求最佳质量
     return {}
 
 def _build_normalized_stream_from_raw(
@@ -310,6 +311,7 @@ def process_gap_region(
                 region_start,
                 new_region,
                 reloc_changes,
+                old_bin=old_bin,
             )
             total_region_bytes = pb.current_size() - start_size
             return (0, 0, 0, 0, 0, total_region_bytes)
@@ -1025,10 +1027,11 @@ def generate_patch(old_path: str, new_path: str,
             before_add = pb.stats['ADD']
             before_copy = pb.stats['COPY']
             emit_best_for_region(
-                pb, 
-                region['old_offset'], 
-                new_bin[region['start']:region['start'] + region['size']], 
-                region['changes']
+                pb,
+                region['old_offset'],
+                new_bin[region['start']:region['start'] + region['size']],
+                region['changes'],
+                old_bin=old_bin,
             )
             semantic_add_count += pb.stats['ADD'] - before_add
             semantic_copy_count += pb.stats['COPY'] - before_copy
@@ -1175,6 +1178,7 @@ def generate_patch_global_only(
             o_off,
             new_bin[n_off:n_off + size],
             changes,
+            old_bin=old_bin,
         )
         cur = n_off + size
 

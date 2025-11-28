@@ -116,7 +116,7 @@ def _choose_best_cover(
 def global_dp_hybrid(
     old_bytes: bytes,
     new_bytes: bytes,
-    min_length: int = 32,
+    min_length: int = 16,
     code_mask: Optional[List[bool]] = None,
     func_boundary_prefix: Optional[List[int]] = None,
     *,

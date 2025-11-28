@@ -18,10 +18,12 @@ HEADER_SIZE = struct.calcsize(HEADER_FMT)
 OP_END  = 0x00
 OP_COPY = 0x01          # old_off,varint ; length,varint（旧偏移、长度）
 OP_ADD  = 0x02          # literal_len,varint ; literal bytes（字面量长度及其数据）
+OP_DIFF = 0x03          # old_off,varint ; length,varint ; diff_data (差分编码: new[i] - old[i])
 OP_PATCH_FROM_OLD = 0x04# old_off,varint ; length,varint ; nchanges,varint ; [delta_off,varint ; clen,varint ; data]...（从旧固件复制并在局部打补丁）
 OP_ADD_LZ4 = 0x05       # ulen,varint ; clen,varint ; cdata (不支持)
 OP_FILL = 0x06          # byte,varint ; length,varint（重复某个字节）
 OP_PATCH_COMPACT = 0x07 # old_off,varint ; length,varint ; nchanges,varint ; change_len,varint ; [delta]... ; [data]...（压缩表示的补丁）
+OP_PATCH_DIFF = 0x08    # 与 PATCH_FROM_OLD 相同格式，但变更数据是差分编码
 
 class Stream:
     """流式读取器，最小内存占用"""
@@ -76,6 +78,7 @@ def apply_patch_in_memory(old_bytes: bytes, patch_data: bytes):
     stats = {
         "copy_bytes": 0,
         "add_bytes": 0,
+        "diff_bytes": 0,
         "patch_bytes": 0,
         "max_literal": 0,
         "max_block": 0,
@@ -105,6 +108,20 @@ def apply_patch_in_memory(old_bytes: bytes, patch_data: bytes):
             pos += lit_len
             stats["add_bytes"] += lit_len
             stats["max_literal"] = max(stats["max_literal"], lit_len)
+
+        elif op == OP_DIFF:
+            # 差分编码：new[i] = old[i] + diff[i]
+            old_off = s.read_uleb128()
+            length = s.read_uleb128()
+            if old_off + length > old_len or pos + length > target_size:
+                raise ValueError("DIFF out of range")
+            diff_data = s.read_exact(length)
+            # 应用差分：new[i] = (old[i] + diff[i]) & 0xFF
+            for i in range(length):
+                out[pos + i] = (old_bytes[old_off + i] + diff_data[i]) & 0xFF
+            pos += length
+            stats["diff_bytes"] += length
+            stats["max_block"] = max(stats["max_block"], length)
 
         elif op == OP_FILL:
             byte_val = s.read_uleb128() & 0xFF
@@ -161,6 +178,31 @@ def apply_patch_in_memory(old_bytes: bytes, patch_data: bytes):
                     data_ptr += change_len
                     last_off = off_in_block
 
+            out[pos:pos + length] = block
+            pos += length
+            stats["patch_bytes"] += length
+            stats["max_block"] = max(stats["max_block"], length)
+
+        elif op == OP_PATCH_DIFF:
+            # 与 PATCH_FROM_OLD 相同，但变更数据使用差分编码
+            old_off = s.read_uleb128()
+            length = s.read_uleb128()
+            nchanges = s.read_uleb128()
+            if old_off + length > old_len or pos + length > target_size:
+                raise ValueError("PATCH_DIFF out of range")
+            block = bytearray(old_bytes[old_off:old_off + length])
+            last_off = 0
+            for _ in range(nchanges):
+                delta = s.read_uleb128()
+                off_in_block = last_off + delta
+                clen = s.read_uleb128()
+                if off_in_block + clen > length:
+                    raise ValueError("PATCH_DIFF chunk out of range")
+                diff_data = s.read_exact(clen)
+                # 应用差分：new[i] = old[i] + diff[i]
+                for i in range(clen):
+                    block[off_in_block + i] = (block[off_in_block + i] + diff_data[i]) & 0xFF
+                last_off = off_in_block
             out[pos:pos + length] = block
             pos += length
             stats["patch_bytes"] += length

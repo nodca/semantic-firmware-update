@@ -390,7 +390,6 @@ def run_ir_experiment(args: argparse.Namespace) -> None:
         old_ir_bytes,
         new_ir_bytes,
         min_length=args.min_match_len,
-        code_mask=None,
         func_boundary_prefix=None,
     )
 

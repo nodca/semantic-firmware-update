@@ -196,6 +196,9 @@ def parse_iar_dump(dump_path: str) -> Dict:
     # === 3) .symtab 区块（可能被拆分，这里做合并） ===
     symbols: Dict[str, Dict] = {}
 
+    # 用于存储 $a/$d/$t 标记（代码/数据边界）
+    code_data_markers: Dict[int, List[Tuple[int, str]]] = {}  # sec_idx -> [(addr, marker_type)]
+
     sym_hdr_iter = list(
         re.finditer(r"^Section #(\d+)\s+\.symtab:", content, re.MULTILINE)
     )
@@ -252,6 +255,11 @@ def parse_iar_dump(dump_path: str) -> Dict:
             hi = ADDR_MAX if ADDR_MAX is not None else FLASH_BASE_MAX
             if not (lo <= addr <= hi):
                 continue
+
+            # 收集 $a/$d/$t 标记（代码/数据边界）
+            if name in ("$a", "$d", "$t"):
+                code_data_markers.setdefault(sec_idx, []).append((addr, name))
+                continue  # 不将这些标记加入普通符号表
 
             by_sec.setdefault(sec_idx, []).append(
                 (addr, name, sym_type, binding, size_decl)
@@ -317,7 +325,7 @@ def parse_iar_dump(dump_path: str) -> Dict:
                 "size_decl": size_decl,
             }
 
-    # === 5) 为感兴趣的代码段提取“归一化掩码”信息 ===
+    # === 5) 为感兴趣的代码段提取"归一化掩码"信息 ===
     for idx, sec in sections.items():
         name = sec.get("name", "")
         if not isinstance(name, str):
@@ -331,7 +339,50 @@ def parse_iar_dump(dump_path: str) -> Dict:
             if norm_sites:
                 sec["norm_sites"] = norm_sites
 
-    return {"segment": segment, "sections": sections, "symbols": symbols}
+    # === 6) 根据 $a/$d/$t 标记生成代码区域列表 ===
+    # $a = ARM 代码, $t = Thumb 代码, $d = 数据
+    # 生成格式: [{"start": addr, "end": addr, "type": "code"|"data"}, ...]
+    code_regions: List[Dict] = []
+    for sec_idx, markers in code_data_markers.items():
+        sec = sections.get(sec_idx)
+        if not sec:
+            continue
+        sec_start = sec.get("addr", 0)
+        sec_end = sec_start + sec.get("size", 0)
+
+        # 按地址排序
+        sorted_markers = sorted(markers, key=lambda x: x[0])
+
+        for i, (addr, marker) in enumerate(sorted_markers):
+            # 确定区域结束地址
+            if i + 1 < len(sorted_markers):
+                end_addr = sorted_markers[i + 1][0]
+            else:
+                end_addr = sec_end
+
+            # 确定区域类型
+            if marker in ("$a", "$t"):
+                region_type = "code"
+            else:  # $d
+                region_type = "data"
+
+            # 计算文件偏移
+            file_off = sec.get("file_offset", 0) + (addr - sec_start)
+
+            if end_addr > addr:
+                code_regions.append({
+                    "start": addr,
+                    "end": end_addr,
+                    "file_offset": file_off,
+                    "size": end_addr - addr,
+                    "type": region_type,
+                    "section_index": sec_idx,
+                })
+
+    # 按起始地址排序
+    code_regions.sort(key=lambda x: x["start"])
+
+    return {"segment": segment, "sections": sections, "symbols": symbols, "code_regions": code_regions}
 
 
 def main() -> None:

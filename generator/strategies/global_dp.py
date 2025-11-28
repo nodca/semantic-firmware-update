@@ -29,7 +29,6 @@ def _compute_coverage(matches: List[Tuple[int, int, int]], new_len: int) -> int:
 
 def _choose_best_cover(
     matches: List[Tuple[int, int, int]],
-    code_prefix: Optional[List[int]] = None,
     func_boundary_prefix: Optional[List[int]] = None,
 ) -> List[Tuple[int, int, int]]:
     """
@@ -49,13 +48,11 @@ def _choose_best_cover(
         copy_bytes = estimate_copy_bytes(o_off, ln)
         add_bytes = estimate_add_bytes(ln)
         weight = add_bytes - copy_bytes
-        if code_prefix is not None:
-            # 对 new_bytes 中落在代码区的字节给予一些额外加分。
-            inside = code_prefix[end] - code_prefix[n_off]
-            if inside > 0:
-                # 每个代码字节都会增加一点得分；总加分不超过 ln，避免权重过大。
-                bonus = min(inside, ln)
-                weight += bonus
+        # 注意：移除了 code_prefix 的 bonus 机制
+        # 原因：当代码覆盖率很高（如 95%）时，几乎所有匹配都获得相似的 bonus，
+        # 这导致 DP 选择的区分度降低，反而可能选择次优的匹配组合。
+        # 现在 code_regions 信息仅用于归一化（只在代码区做归一化），
+        # 而不是在 DP 权重中加分。
         if func_boundary_prefix is not None:
             # 对跨越过多函数起始边界的匹配施加惩罚。
             # 近似策略：统计严格落在区间 (n_off, end) 内的函数起始位置个数。
@@ -117,7 +114,6 @@ def global_dp_hybrid(
     old_bytes: bytes,
     new_bytes: bytes,
     min_length: int = 16,
-    code_mask: Optional[List[bool]] = None,
     func_boundary_prefix: Optional[List[int]] = None,
     *,
     greedy_block: int = 32,
@@ -134,16 +130,11 @@ def global_dp_hybrid(
     """
     new_len = len(new_bytes)
 
-    # 1) 可选：基于代码区构建前缀和，用于加权
-    code_prefix: Optional[List[int]] = None
-    if code_mask is not None and len(code_mask) == new_len:
-        code_prefix = [0] * (new_len + 1)
-        acc = 0
-        for i, flag in enumerate(code_mask):
-            acc += 1 if flag else 0
-            code_prefix[i + 1] = acc
+    # 注意：code_mask 现在仅用于外部归一化逻辑（只在代码区做归一化），
+    # 不再用于 DP 权重加分。这是因为当代码覆盖率很高（如 95%）时，
+    # 几乎所有匹配都获得相似的 bonus，反而降低了 DP 选择的区分度。
 
-    # 2) 全局匹配
+    # 1) 全局匹配
     global_matches = find_global_matches(old_bytes, new_bytes, min_length)
     cov_g = _compute_coverage(global_matches, new_len)
     if new_len > 0:
@@ -177,7 +168,6 @@ def global_dp_hybrid(
     all_matches = global_matches + local_matches
     final_matches = _choose_best_cover(
         all_matches,
-        code_prefix=code_prefix,
         func_boundary_prefix=func_boundary_prefix,
     )
     cov_f = _compute_coverage(final_matches, new_len)

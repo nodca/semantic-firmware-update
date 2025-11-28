@@ -134,86 +134,133 @@ def _build_code_mask_from_symbols(
 ) -> Tuple[Optional[List[bool]], Optional[List[int]]]:
     """
     Construct a boolean code mask and function-boundary prefix array from symbol metadata.
+
+    优先使用 code_regions（从 $a/$d/$t 标记提取），这是最准确的代码/数据区分信息。
+    如果没有 code_regions，则回退到基于符号的推断。
     """
     if new_len <= 0:
         return None, None
 
     mask = [False] * new_len
     func_flags = [False] * new_len
-    code_names: set = set()
-    symbol_meta = None
+    code_bytes_from_regions = 0
+    data_bytes_from_regions = 0
 
+    # ===== 优先使用 code_regions（从 $a/$d/$t 标记提取）=====
     if isinstance(raw_json, dict):
-        symbol_meta = raw_json.get("symbols")
-        if isinstance(symbol_meta, dict):
+        code_regions = raw_json.get("code_regions", [])
+        if code_regions and isinstance(code_regions, list):
+            for region in code_regions:
+                if not isinstance(region, dict):
+                    continue
+                region_type = region.get("type", "")
+                if region_type != "code":
+                    # 统计数据区大小
+                    data_bytes_from_regions += region.get("size", 0)
+                    continue
+                # 获取文件偏移和大小
+                off = region.get("file_offset")
+                size = region.get("size", 0)
+                if off is None and "start" in region:
+                    # 如果没有 file_offset，尝试从地址计算
+                    try:
+                        off = int(region["start"]) - flash_base
+                    except Exception:
+                        continue
+                if off is None or size <= 0:
+                    continue
+                # 标记代码区域
+                end = min(new_len, off + size)
+                if off < 0:
+                    off = 0
+                if off < end:
+                    for idx in range(off, end):
+                        mask[idx] = True
+                    code_bytes_from_regions += (end - off)
+
+            if code_bytes_from_regions > 0:
+                print(f"[GLOBAL] code_regions: code={code_bytes_from_regions} bytes, data={data_bytes_from_regions} bytes")
+
+    # ===== 如果 code_regions 没有覆盖，回退到符号推断 =====
+    code_bytes = sum(1 for flag in mask if flag)
+
+    if code_bytes == 0:
+        # 回退到基于符号的推断
+        code_names: set = set()
+        symbol_meta = None
+
+        if isinstance(raw_json, dict):
+            symbol_meta = raw_json.get("symbols")
+            if isinstance(symbol_meta, dict):
+                for name, meta in symbol_meta.items():
+                    entries = meta if isinstance(meta, list) else [meta]
+                    for ent in entries:
+                        if not isinstance(ent, dict):
+                            continue
+                        typ = str(ent.get("type", "")).lower()
+                        if typ == "code":
+                            code_names.add(name)
+
+        def _mark_range(name: str, off: int, size: int) -> None:
+            if size <= 0 or off >= new_len or off < 0:
+                return
+            end = min(new_len, off + size)
+            for idx in range(off, end):
+                mask[idx] = True
+            if _looks_like_function(name) and size >= 24:
+                func_flags[off] = True
+
+        has_ranges = False
+        if parsed_syms:
+            for name, entries in parsed_syms.items():
+                if not entries:
+                    continue
+                is_code = True if not code_names else (name in code_names)
+                if not is_code:
+                    continue
+                for sym in entries:
+                    off = int(getattr(sym, "off", -1))
+                    size = int(getattr(sym, "size", 0))
+                    _mark_range(name, off, size)
+                    has_ranges = True
+
+        if not has_ranges and isinstance(symbol_meta, dict):
             for name, meta in symbol_meta.items():
+                is_code = True if not code_names else (name in code_names)
+                if not is_code:
+                    continue
                 entries = meta if isinstance(meta, list) else [meta]
                 for ent in entries:
                     if not isinstance(ent, dict):
                         continue
-                    typ = str(ent.get("type", "")).lower()
-                    if typ == "code":
-                        code_names.add(name)
-
-    def _mark_range(name: str, off: int, size: int) -> None:
-        if size <= 0 or off >= new_len or off < 0:
-            return
-        end = min(new_len, off + size)
-        for idx in range(off, end):
-            mask[idx] = True
-        if _looks_like_function(name) and size >= 24:
-            func_flags[off] = True
-
-    has_ranges = False
-    if parsed_syms:
-        for name, entries in parsed_syms.items():
-            if not entries:
-                continue
-            is_code = True if not code_names else (name in code_names)
-            if not is_code:
-                continue
-            for sym in entries:
-                off = int(getattr(sym, "off", -1))
-                size = int(getattr(sym, "size", 0))
-                _mark_range(name, off, size)
-                has_ranges = True
-
-    if not has_ranges and isinstance(symbol_meta, dict):
-        for name, meta in symbol_meta.items():
-            is_code = True if not code_names else (name in code_names)
-            if not is_code:
-                continue
-            entries = meta if isinstance(meta, list) else [meta]
-            for ent in entries:
-                if not isinstance(ent, dict):
-                    continue
-                try:
-                    size = int(ent.get("size", 0) or 0)
-                except Exception:
-                    continue
-                if size <= 0:
-                    continue
-                off = None
-                if "addr" in ent:
                     try:
-                        off = int(ent["addr"]) - flash_base
+                        size = int(ent.get("size", 0) or 0)
                     except Exception:
-                        off = None
-                if off is None and "file_offset" in ent:
-                    try:
-                        off = int(ent["file_offset"])
-                    except Exception:
-                        off = None
-                if off is None and "off" in ent:
-                    try:
-                        off = int(ent["off"])
-                    except Exception:
-                        off = None
-                if off is None:
-                    continue
-                _mark_range(name, off, size)
+                        continue
+                    if size <= 0:
+                        continue
+                    off = None
+                    if "addr" in ent:
+                        try:
+                            off = int(ent["addr"]) - flash_base
+                        except Exception:
+                            off = None
+                    if off is None and "file_offset" in ent:
+                        try:
+                            off = int(ent["file_offset"])
+                        except Exception:
+                            off = None
+                    if off is None and "off" in ent:
+                        try:
+                            off = int(ent["off"])
+                        except Exception:
+                            off = None
+                    if off is None:
+                        continue
+                    _mark_range(name, off, size)
 
-    code_bytes = sum(1 for flag in mask if flag)
+        code_bytes = sum(1 for flag in mask if flag)
+
     if code_bytes == 0:
         mask = None
     else:
@@ -1101,7 +1148,7 @@ def generate_patch_global_only(
     old_raw, old_parsed = load_symbol_context(old_sym_json, None, flash_base, len(old_bin))
     new_raw, new_parsed = load_symbol_context(new_sym_json, None, flash_base, len(new_bin))
 
-    code_mask, func_start_prefix = _build_code_mask_from_symbols(
+    _, func_start_prefix = _build_code_mask_from_symbols(
         new_raw,
         new_parsed,
         new_len,
@@ -1126,7 +1173,6 @@ def generate_patch_global_only(
         old_match_bytes,
         new_match_bytes,
         min_length=min_match_len,
-        code_mask=code_mask,
         func_boundary_prefix=func_start_prefix,
         **speed_kwargs,
     )
